@@ -219,7 +219,7 @@ func (s *Syncer) retireAbsent(ctx context.Context, m catalog.Manifest, result *R
 			continue
 		}
 		if _, err := s.pay.DeactivatePrice(ctx, ov.Version.Account,
-			"catsync:deactivate:"+ov.Version.PriceID, ov.Version.PriceID); err != nil {
+			deactivationKey(ov.Version.PriceID), ov.Version.PriceID); err != nil {
 			return fmt.Errorf("stripesync: retire %q: %w", ov.Slug, err)
 		}
 		err := s.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
@@ -248,11 +248,8 @@ func (s *Syncer) reconcileProductName(ctx context.Context, account core.AccountR
 	if product.Name == item.Name {
 		return nil
 	}
-	// The rename key is bound to the desired name: renaming X→Y→X within
-	// Stripe's idempotency window still produces fresh requests.
-	sum := sha256.Sum256([]byte(item.Name))
 	if _, err := s.pay.UpdateProductName(ctx, account,
-		"catsync:rename:"+productID+":"+hex.EncodeToString(sum[:8]),
+		"catsync:rename:"+productID+":"+uuid.New().String(),
 		productID, item.Name); err != nil {
 		return err
 	}
@@ -276,7 +273,7 @@ func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored cat
 		return err
 	}
 	price, err := s.pay.CreatePrice(ctx, account,
-		priceIdempotencyKey(s.env, item.Slug, item.Price, "none"),
+		priceIdempotencyKey(s.env, item.Slug, item.Price, product.ID, "none"),
 		priceSpec(product.ID, item))
 	if err != nil {
 		return err
@@ -291,7 +288,7 @@ func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored cat
 // rotate replaces the current price with the manifest's.
 func (s *Syncer) rotate(ctx context.Context, account core.AccountRef, stored catalogdb.Item, current catalogdb.PriceVersion, item catalog.Item) error {
 	price, err := s.pay.CreatePrice(ctx, account,
-		priceIdempotencyKey(s.env, item.Slug, item.Price, current.PriceID),
+		priceIdempotencyKey(s.env, item.Slug, item.Price, current.ProductID, current.PriceID),
 		priceSpec(current.ProductID, item))
 	if err != nil {
 		return err
@@ -300,7 +297,7 @@ func (s *Syncer) rotate(ctx context.Context, account core.AccountRef, stored cat
 	// mid-way, the next run recreates the same successor (same idempotency
 	// key) and deactivating an already-inactive price is a no-op.
 	if _, err := s.pay.DeactivatePrice(ctx, account,
-		"catsync:deactivate:"+current.PriceID, current.PriceID); err != nil {
+		deactivationKey(current.PriceID), current.PriceID); err != nil {
 		return err
 	}
 
@@ -406,15 +403,31 @@ func version(itemID uuid.UUID, env core.StripeEnvironment, account core.AccountR
 	}
 }
 
-// priceIdempotencyKey is deterministic over the price's content and the
-// price it replaces. Same manifest, same predecessor → same key, so a
-// crashed sync replays instead of duplicating. A price changed A→B→A within
-// Stripe's idempotency window still gets a fresh key, because the
-// predecessor differs.
-func priceIdempotencyKey(env core.StripeEnvironment, slug string, spec catalog.PriceSpec, previousPriceID string) string {
-	content := fmt.Sprintf("%s|%s|%d|%s|%t|%s|%d|%s",
+// deactivationKey is fresh per attempt, deliberately. Stripe caches a
+// request's result under its idempotency key INCLUDING errors, so retrying a
+// failed deactivation on a deterministic key would replay the cached failure
+// for the whole retention window — a wedge, not a retry. Deactivation is
+// naturally idempotent (inactive twice is inactive), so the key's only job
+// is satisfying the wrapper's no-auto-generation rule; deduplication would
+// buy nothing. Creates are the opposite case: there the key IS the
+// crash-safety, so those stay deterministic and a cached error means the
+// sync fails loudly until the window lapses, which is safe.
+func deactivationKey(priceID string) string {
+	return "catsync:deactivate:" + priceID + ":" + uuid.New().String()
+}
+
+// priceIdempotencyKey is deterministic over every create parameter — the
+// product included — and the price it replaces. Same manifest, same product,
+// same predecessor → same key, so a crashed sync replays instead of
+// duplicating; A→B→A within Stripe's idempotency window still gets a fresh
+// key because the predecessor differs. The product id earned its place the
+// hard way: a key that omits a parameter wedges with idempotency_error the
+// first time that parameter diverges, which a local-database rebuild against
+// a remembering Stripe demonstrated in practice.
+func priceIdempotencyKey(env core.StripeEnvironment, slug string, spec catalog.PriceSpec, productID, previousPriceID string) string {
+	content := fmt.Sprintf("%s|%s|%d|%s|%t|%s|%d|%s|%s",
 		env.String(), slug, spec.Amount, spec.Currency,
-		spec.Recurring, spec.Interval, spec.IntervalCount, previousPriceID)
+		spec.Recurring, spec.Interval, spec.IntervalCount, productID, previousPriceID)
 	sum := sha256.Sum256([]byte(content))
 	return "catsync:price:" + slug + ":" + hex.EncodeToString(sum[:16])
 }

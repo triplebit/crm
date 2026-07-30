@@ -410,16 +410,19 @@ func TestPriceIdempotencyKeyIsDeterministicAndPredecessorBound(t *testing.T) {
 	t.Parallel()
 	spec := catalog.PriceSpec{Amount: 1500, Currency: "usd", Recurring: true, Interval: "month", IntervalCount: 1}
 
-	a := priceIdempotencyKey(core.StripeSandbox, "tier", spec, "price_1")
-	b := priceIdempotencyKey(core.StripeSandbox, "tier", spec, "price_1")
+	a := priceIdempotencyKey(core.StripeSandbox, "tier", spec, "prod_1", "price_1")
+	b := priceIdempotencyKey(core.StripeSandbox, "tier", spec, "prod_1", "price_1")
 	if a != b {
 		t.Error("the same spec and predecessor produced different keys; a crashed sync would duplicate the price")
 	}
-	if priceIdempotencyKey(core.StripeSandbox, "tier", spec, "price_2") == a {
+	if priceIdempotencyKey(core.StripeSandbox, "tier", spec, "prod_1", "price_2") == a {
 		t.Error("a different predecessor produced the same key; A→B→A inside the idempotency window would replay the stale price")
 	}
+	if priceIdempotencyKey(core.StripeSandbox, "tier", spec, "prod_2", "price_1") == a {
+		t.Error("a different product produced the same key; a rebuilt product would wedge on idempotency_error")
+	}
 	spec.Amount = 2000
-	if priceIdempotencyKey(core.StripeSandbox, "tier", spec, "price_1") == a {
+	if priceIdempotencyKey(core.StripeSandbox, "tier", spec, "prod_1", "price_1") == a {
 		t.Error("a different amount produced the same key")
 	}
 }

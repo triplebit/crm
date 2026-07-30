@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	stripe "github.com/stripe/stripe-go/v86"
 
@@ -66,6 +67,38 @@ func (c *Client) GetCustomer(ctx context.Context, account core.AccountRef, custo
 		return Customer{}, fmt.Errorf("stripepay: retrieve customer %s: %w", customerID, err)
 	}
 	return toCustomer(got), nil
+}
+
+// FindCustomerByLocalAccount searches one account for the Customer carrying
+// the given portal account id in its metadata. It exists for exactly one
+// caller: reconciling an unresolved creation intent whose idempotency record
+// Stripe may have pruned (~24 hours), where blindly re-creating could mint a
+// duplicate. Search is eventually consistent — minutes at worst — which is
+// safe here: a Customer young enough to be missed by search is young enough
+// that its idempotency record still deduplicates the re-create.
+func (c *Client) FindCustomerByLocalAccount(ctx context.Context, account core.AccountRef, localAccountID string) (Customer, bool, error) {
+	if strings.ContainsAny(localAccountID, `'\`) {
+		return Customer{}, false, errors.New("stripepay: local account id is not a plain identifier")
+	}
+	ctxID, err := c.contextFor(account)
+	if err != nil {
+		return Customer{}, false, err
+	}
+	list := c.sc.V1Customers.Search(ctx, &stripe.CustomerSearchParams{
+		SearchParams: stripe.SearchParams{
+			Query:         fmt.Sprintf("metadata['portal_account_id']:'%s'", localAccountID),
+			Limit:         stripe.Int64(1),
+			Single:        true,
+			StripeContext: stripe.String(ctxID),
+		},
+	})
+	for found, err := range list.All(ctx) {
+		if err != nil {
+			return Customer{}, false, fmt.Errorf("stripepay: search customers: %w", err)
+		}
+		return toCustomer(found), true, nil
+	}
+	return Customer{}, false, nil
 }
 
 // IsNotFound reports whether err is Stripe saying the object does not exist

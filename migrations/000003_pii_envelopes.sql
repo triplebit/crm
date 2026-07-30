@@ -21,6 +21,30 @@
 -- dots), mirroring what cryptox rejects as malformed without freezing its
 -- internals into the schema.
 
+-- Preflight: this migration converts types with USING NULL, which is only
+-- lossless because the columns are unwritten. That precondition is asserted,
+-- not assumed — a database holding any legacy ciphertext refuses the
+-- migration loudly instead of destroying PII silently. (No such database
+-- exists; the assertion is the difference between knowing that and hoping it.)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM orders
+               WHERE imei_ciphertext IS NOT NULL
+                  OR shipping_address_ciphertext IS NOT NULL)
+       OR EXISTS (SELECT 1 FROM assets
+                  WHERE imei_ciphertext IS NOT NULL
+                     OR serial_number_ciphertext IS NOT NULL
+                     OR iccid_ciphertext IS NOT NULL)
+       OR EXISTS (SELECT 1 FROM fulfillments
+                  WHERE tracking_number_ciphertext IS NOT NULL
+                     OR staff_notes_ciphertext IS NOT NULL)
+       OR EXISTS (SELECT 1 FROM donor_notes)
+    THEN
+        RAISE EXCEPTION 'migration 000003 expects every ciphertext column to be '
+            'unwritten; this database holds values the type conversion would destroy';
+    END IF;
+END $$;
+
 ALTER TABLE orders
     ALTER COLUMN imei_ciphertext TYPE text USING NULL,
     ALTER COLUMN shipping_address_ciphertext TYPE text USING NULL,

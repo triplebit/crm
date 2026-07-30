@@ -125,7 +125,32 @@ func (s *Service) EnsureCustomer(ctx context.Context, account core.AccountRef, p
 		return "", err
 	}
 
-	if intent.CustomerID == nil {
+	switch {
+	case intent.CustomerID != nil:
+		customerID = *intent.CustomerID
+
+	case !intent.Fresh:
+		// An unresolved intent from an earlier attempt is the crash-window
+		// signature: the Customer may exist remotely with nothing recorded
+		// locally, and Stripe prunes idempotency records after ~24 hours, so
+		// re-creating on the old key is only safe inside that window.
+		// Reconcile by metadata search first; a Customer too young for
+		// eventually-consistent search to see is young enough that the
+		// idempotency record still deduplicates the create below.
+		found, ok, err := s.pay.FindCustomerByLocalAccount(ctx, intent.OriginAccount, person.UserID.String())
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			if err := s.customers.RecordIntentResult(ctx, s.pool.Conn(), intent.ID, found.ID, s.now().UTC()); err != nil {
+				return "", err
+			}
+			customerID = found.ID
+			break
+		}
+		fallthrough
+
+	default:
 		created, err := s.pay.CreateCustomer(ctx, intent.OriginAccount, intent.Idempotency, stripepay.CustomerSpec{
 			Email:          intent.Email,
 			Name:           intent.Name,
@@ -138,13 +163,14 @@ func (s *Service) EnsureCustomer(ctx context.Context, account core.AccountRef, p
 			return "", err
 		}
 		customerID = created.ID
-		// The origin account has the Customer by definition; record the
-		// observation so the fast path works next time.
-		if err := s.customers.RecordCustomer(ctx, s.pool.Conn(), person.UserID, s.env, intent.OriginAccount, customerID, s.now().UTC()); err != nil {
-			return "", err
-		}
-	} else {
-		customerID = *intent.CustomerID
+	}
+
+	// The origin projection is repaired on every path — including resuming a
+	// recorded intent, where an earlier crash may have died exactly between
+	// recording the intent and writing this row. Without this, that person
+	// would consult the intent on every request forever.
+	if err := s.customers.RecordCustomer(ctx, s.pool.Conn(), person.UserID, s.env, intent.OriginAccount, customerID, s.now().UTC()); err != nil {
+		return "", err
 	}
 
 	// If the caller's account is not the origin, the Customer arrives there

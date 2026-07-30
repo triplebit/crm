@@ -42,6 +42,13 @@ type Intent struct {
 	// CustomerID and RemoteCreatedAt are set together once Stripe answers.
 	CustomerID      *string
 	RemoteCreatedAt *time.Time
+
+	// Fresh reports whether this call inserted the intent. A found intent
+	// that is still unresolved is the crash-window signature: an earlier
+	// attempt may have created the Customer remotely without recording it,
+	// and Stripe's idempotency records are pruned after ~24 hours — so the
+	// caller reconciles against Stripe before daring another create.
+	Fresh bool
 }
 
 // EnsureIntent returns the person's intent for this environment, creating it
@@ -70,6 +77,7 @@ func (r *Repo) EnsureIntent(ctx context.Context, q db.Conn, userID uuid.UUID, en
 		return Intent{}, fmt.Errorf("customers: ensure intent: %w", db.Normalize(err))
 	}
 	intent.Environment = env
+	intent.Fresh = intent.ID == id
 	return intent, nil
 }
 
@@ -107,17 +115,28 @@ func (r *Repo) CustomerIDFor(ctx context.Context, q db.Conn, userID uuid.UUID, e
 }
 
 // RecordCustomer stores that a Customer was observed in one account context.
-// Idempotent: re-observing the same customer is a no-op, and observing a
-// different one for the same context trips the unique index, loudly.
+// Re-observing the same customer is a no-op; observing a DIFFERENT customer
+// for the same context is an invariant violation and fails loudly — one
+// person has one Customer per environment, and a second identifier appearing
+// means the idempotency discipline broke somewhere upstream.
 func (r *Repo) RecordCustomer(ctx context.Context, q db.Conn, userID uuid.UUID, env core.StripeEnvironment, account core.AccountRef, customerID string, at time.Time) error {
-	_, err := q.Exec(ctx, `
+	// The conflict action only "updates" when the stored id already equals
+	// the observed one (a self-assignment), so RowsAffected is 1 for insert
+	// and for same-id re-observation, and 0 exactly when a different id is
+	// already recorded.
+	tag, err := q.Exec(ctx, `
 		INSERT INTO stripe_customers (id, user_id, environment, account_ref, customer_id, observed_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (user_id, environment, account_ref) WHERE user_id IS NOT NULL
-			DO NOTHING
+			DO UPDATE SET customer_id = stripe_customers.customer_id
+			WHERE stripe_customers.customer_id = EXCLUDED.customer_id
 	`, uuid.New(), userID, env.String(), account.String(), customerID, at)
 	if err != nil {
 		return fmt.Errorf("customers: record customer: %w", db.Normalize(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("customers: %s already has a different Stripe customer in %s/%s than %s",
+			userID, env.String(), account.String(), customerID)
 	}
 	return nil
 }

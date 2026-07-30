@@ -30,10 +30,11 @@ import (
 type Server struct {
 	mu sync.Mutex
 
-	server   *httptest.Server
-	byIdem   map[string]map[string]any
-	prices   map[string]map[string]any
-	products map[string]map[string]any
+	server    *httptest.Server
+	byIdem    map[string]map[string]any
+	byIdemErr map[string]int // idempotency key → cached error status
+	prices    map[string]map[string]any
+	products  map[string]map[string]any
 
 	customers       map[string]map[string]any
 	customerOrigin  map[string]string // customer id → acct that created it
@@ -53,6 +54,7 @@ func New(t *testing.T) *Server {
 	t.Helper()
 	f := &Server{
 		byIdem:         map[string]map[string]any{},
+		byIdemErr:      map[string]int{},
 		prices:         map[string]map[string]any{},
 		products:       map[string]map[string]any{},
 		customers:      map[string]map[string]any{},
@@ -161,12 +163,36 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	respond := func(obj map[string]any) { _ = json.NewEncoder(w).Encode(obj) }
 	context := r.Header.Get("Stripe-Context")
 
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/products":
-		if prior, ok := f.byIdem[r.Header.Get("Idempotency-Key")]; ok {
+	// Stripe caches a request's result under its idempotency key REGARDLESS
+	// of whether it succeeded — a replayed key returns the cached response,
+	// errors included. Modelling that here is what makes "retry with the
+	// same key" tests honest: production would replay a cached 500, so the
+	// fake does too.
+	if idem := r.Header.Get("Idempotency-Key"); idem != "" && r.Method == http.MethodPost {
+		if status, ok := f.byIdemErr[idem]; ok {
+			http.Error(w, `{"error":{"message":"cached error replayed for idempotency key"}}`, status)
+			return
+		}
+		if prior, ok := f.byIdem[idem]; ok {
 			respond(prior)
 			return
 		}
+	}
+
+	failInjected := func(counter *int, idem string) bool {
+		if *counter > 0 {
+			*counter--
+			if idem != "" {
+				f.byIdemErr[idem] = http.StatusInternalServerError
+			}
+			http.Error(w, `{"error":{"message":"injected failure"}}`, http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/products":
 		f.creates++
 		obj := map[string]any{
 			"id": fmt.Sprintf("prod_%d", f.creates), "object": "product",
@@ -197,10 +223,6 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		respond(obj)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/prices":
-		if prior, ok := f.byIdem[r.Header.Get("Idempotency-Key")]; ok {
-			respond(prior)
-			return
-		}
 		f.creates++
 		obj := map[string]any{
 			"id": fmt.Sprintf("price_%d", f.creates), "object": "price",
@@ -227,9 +249,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.PostForm.Get("active") == "false" {
-			if f.failDeactivate > 0 {
-				f.failDeactivate--
-				http.Error(w, `{"error":{"message":"injected failure"}}`, http.StatusInternalServerError)
+			if failInjected(&f.failDeactivate, r.Header.Get("Idempotency-Key")) {
 				return
 			}
 			obj["active"] = false
@@ -245,13 +265,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "price")
 
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/customers":
-		if prior, ok := f.byIdem[r.Header.Get("Idempotency-Key")]; ok {
-			respond(prior)
-			return
-		}
-		if f.failCustCreates > 0 {
-			f.failCustCreates--
-			http.Error(w, `{"error":{"message":"injected failure"}}`, http.StatusInternalServerError)
+		if failInjected(&f.failCustCreates, r.Header.Get("Idempotency-Key")) {
 			return
 		}
 		f.creates++
@@ -265,6 +279,24 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		f.customerOrigin[id] = context
 		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
 		respond(obj)
+
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/customers/search":
+		// Matches only the metadata query EnsureCustomer's reconciliation
+		// uses. Deliberately consistent immediately; the eventual-consistency
+		// caveat is handled in the caller's design, not simulated here.
+		query := r.URL.Query().Get("query")
+		var data []map[string]any
+		for _, c := range f.customers {
+			meta := c["metadata"].(map[string]any)
+			if strings.Contains(query, "'"+meta["portal_account_id"].(string)+"'") {
+				data = append(data, c)
+				break
+			}
+		}
+		if data == nil {
+			data = []map[string]any{}
+		}
+		respond(map[string]any{"object": "search_result", "data": data, "has_more": false})
 
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/customers/"):
 		f.customerGets++

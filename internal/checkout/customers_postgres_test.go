@@ -162,6 +162,70 @@ func TestEnsureCustomerResumesFromARecordedIntent(t *testing.T) {
 	if fake.Creates() != 0 {
 		t.Errorf("%d remote creates, want 0: the intent already holds the answer", fake.Creates())
 	}
+
+	// The resume must also repair the origin projection the crash skipped —
+	// otherwise this person consults the intent on every request forever.
+	stored, err := repo.CustomerIDFor(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships)
+	if err != nil || stored != "cus_fromthecrash" {
+		t.Fatalf("origin projection after resume = %q (%v), want cus_fromthecrash", stored, err)
+	}
+	_, _, getsBefore := fake.Gets()
+	if _, err := svc.EnsureCustomer(ctx, core.Memberships, person); err != nil {
+		t.Fatalf("post-repair call: %v", err)
+	}
+	if _, _, gets := fake.Gets(); gets != getsBefore {
+		t.Error("the post-repair call was not the fast path")
+	}
+}
+
+// The >24h crash window: an unresolved intent whose idempotency record
+// Stripe may have pruned. Blindly re-creating could mint a second Customer,
+// so EnsureCustomer reconciles by metadata search first and adopts what it
+// finds.
+func TestStaleUnresolvedIntentAdoptsTheExistingCustomer(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+	repo := customers.New()
+
+	// The crash: the intent was recorded and the Customer created remotely,
+	// but the result was never persisted. (Created directly against the
+	// fake, carrying the metadata the reconciliation searches by.)
+	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships, person.Email, person.Name)
+	if err != nil {
+		t.Fatalf("EnsureIntent: %v", err)
+	}
+	pay, err := stripepay.New(stripepay.Options{
+		APIKey:               "sk_test_checkout",
+		Environment:          core.StripeSandbox,
+		MembershipsAccountID: "acct_m1",
+		DonationsAccountID:   "acct_d1",
+		BaseURL:              fake.URL(),
+	})
+	if err != nil {
+		t.Fatalf("stripepay.New: %v", err)
+	}
+	orphan, err := pay.CreateCustomer(ctx, core.Memberships, intent.Idempotency, stripepay.CustomerSpec{
+		Email: person.Email, Name: person.Name, LocalAccountID: person.UserID.String(),
+	})
+	if err != nil {
+		t.Fatalf("simulate crashed create: %v", err)
+	}
+
+	got, err := svc.EnsureCustomer(ctx, core.Memberships, person)
+	if err != nil {
+		t.Fatalf("EnsureCustomer: %v", err)
+	}
+	if got != orphan.ID {
+		t.Errorf("EnsureCustomer returned %s, want the reconciled %s", got, orphan.ID)
+	}
+	if fake.Creates() != 1 {
+		t.Errorf("%d total creates, want 1: reconciliation must adopt, never mint", fake.Creates())
+	}
+	if fake.CustomerCount() != 1 {
+		t.Errorf("%d customers exist, want 1", fake.CustomerCount())
+	}
 }
 
 // Racing requests — including ones targeting different accounts — converge on
