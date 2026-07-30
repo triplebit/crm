@@ -1,0 +1,55 @@
+{
+  "items": [
+    {
+      "slug": "hotspot-annual",
+      "name": "Hotspot Membership — Annual",
+      "kind": "hotspot_tier",
+      "price": {"amount": "400.00", "currency": "usd", "recurring": true, "interval": "year"}
+    },
+    {
+      "slug": "hotspot-quarterly",
+      "name": "Hotspot Membership — Quarterly",
+      "kind": "hotspot_tier",
+      "price": {"amount": "150.00", "currency": "usd", "recurring": true, "interval": "month", "interval_count": 3}
+    },
+    {
+      "slug": "hotspot-monthly",
+      "name": "Hotspot Membership — Monthly",
+      "kind": "hotspot_tier",
+      "price": {"amount": "75.00", "currency": "usd", "recurring": true, "interval": "month"}
+    },
+    {
+      "slug": "hotspot-device",
+      "name": "Hotspot Device",
+      "kind": "device",
+      "requires_shipping": true,
+      "requires_imei": true,
+      "inventory_tracked": true,
+      "price": {"amount": "100.00", "currency": "usd"}
+    },
+    {
+      "slug": "friends-5",
+      "name": "Friends of Triplebit — $5 monthly",
+      "kind": "friends_tier",
+      "price": {"amount": "5.00", "currency": "usd", "recurring": true, "interval": "month"}
+    },
+    {
+      "slug": "friends-10",
+      "name": "Friends of Triplebit — $10 monthly",
+      "kind": "friends_tier",
+      "price": {"amount": "10.00", "currency": "usd", "recurring": true, "interval": "month"}
+    },
+    {
+      "slug": "friends-25",
+      "name": "Friends of Triplebit — $25 monthly",
+      "kind": "friends_tier",
+      "price": {"amount": "25.00", "currency": "usd", "recurring": true, "interval": "month"}
+    },
+    {
+      "slug": "friends-50",
+      "name": "Friends of Triplebit — $50 monthly",
+      "kind": "friends_tier",
+      "price": {"amount": "50.00", "currency": "usd", "recurring": true, "interval": "month"}
+    }
+  ]
+}

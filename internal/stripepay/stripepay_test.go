@@ -262,6 +262,18 @@ func TestKeyModeMustMatchEnvironment(t *testing.T) {
 		t.Error("a malformed key was accepted")
 	}
 
+	// Organization-level keys are what a two-account Organization issues.
+	org := base
+	org.APIKey, org.Environment = "sk_org_test_abc", core.StripeSandbox
+	if _, err := New(org); err != nil {
+		t.Errorf("an organization test key was rejected: %v", err)
+	}
+	orgLive := base
+	orgLive.APIKey, orgLive.Environment = "sk_org_live_abc", core.StripeSandbox
+	if _, err := New(orgLive); err == nil {
+		t.Error("an organization live key was accepted against the sandbox")
+	}
+
 	same := base
 	same.APIKey, same.Environment = "sk_test_abc", core.StripeSandbox
 	same.DonationsAccountID = membershipsAcct

@@ -128,11 +128,21 @@ func New(opts Options) (*Client, error) {
 }
 
 // checkKeyEnvironment refuses a key whose mode disagrees with the configured
-// Stripe universe. The prefixes are documented Stripe conventions: sk_live_/
-// rk_live_ keys move real money.
+// Stripe universe. The prefixes are Stripe conventions: account-level secret
+// and restricted keys (sk_/rk_), and organization-level keys (sk_org_),
+// which is what a two-account Organization actually issues. Live-mode keys
+// move real money.
 func checkKeyEnvironment(key string, env core.StripeEnvironment) error {
-	live := strings.HasPrefix(key, "sk_live_") || strings.HasPrefix(key, "rk_live_")
-	test := strings.HasPrefix(key, "sk_test_") || strings.HasPrefix(key, "rk_test_")
+	hasAny := func(prefixes ...string) bool {
+		for _, p := range prefixes {
+			if strings.HasPrefix(key, p) {
+				return true
+			}
+		}
+		return false
+	}
+	live := hasAny("sk_live_", "rk_live_", "sk_org_live_")
+	test := hasAny("sk_test_", "rk_test_", "sk_org_test_")
 	switch {
 	case !live && !test:
 		return errors.New("stripepay: the API key is neither a live nor a test secret key")
