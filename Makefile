@@ -13,7 +13,7 @@ TEST_DB_URL  ?= postgres://portal:portal@127.0.0.1:$(TEST_DB_PORT)/portal_test?s
 # conveniences.)
 .PHONY: all check build test test-db vet fmt fmt-check generate generate-check \
         layercheck lint-cookie mod-verify vuln compose-check docker-build \
-        docker-check db-up db-down clean
+        docker-check outdated db-up db-down clean
 
 all: check
 
@@ -37,7 +37,7 @@ db-up:
 	docker rm -f triplebit-pg >/dev/null 2>&1 || true
 	docker run -d --name triplebit-pg \
 		-e POSTGRES_USER=portal -e POSTGRES_PASSWORD=portal -e POSTGRES_DB=portal_test \
-		-p $(TEST_DB_PORT):5432 postgres:17-alpine >/dev/null
+		-p $(TEST_DB_PORT):5432 postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 >/dev/null # 18.4-alpine
 	@until docker exec triplebit-pg pg_isready -U portal -d portal_test >/dev/null 2>&1; do sleep 1; done
 	@echo "test database ready: $(TEST_DB_URL)"
 
@@ -97,7 +97,7 @@ mod-verify:
 # A merge gate, not an advisory sidecar. Pinned to a version, like everything
 # else that runs in CI; update it deliberately.
 vuln:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 # Validates compose.yaml without starting anything. The dummy values satisfy
 # the ":?" required-variable checks, whose job is refusing a real start-up
@@ -115,6 +115,7 @@ compose-check:
 	PORTAL_STRIPE_SECRET_KEY=check \
 	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
 	docker compose --env-file /dev/null config -q
 	@# And prove the required-variable guards are guards: with one unset,
 	@# compose must refuse. Otherwise a weakened ":?" that silently defaulted
@@ -125,6 +126,7 @@ compose-check:
 		PORTAL_STRIPE_SECRET_KEY=check \
 		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+		POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
 		docker compose --env-file /dev/null config -q 2>/dev/null; then \
 		echo "compose accepted a missing PORTAL_SESSION_KEY; the required-variable guard is not a guard"; \
 		exit 1; \
@@ -153,7 +155,39 @@ docker-check:
 	PORTAL_STRIPE_SECRET_KEY=check \
 	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
 	docker compose --env-file /dev/null build --quiet
+
+# Reports what has moved on upstream. Deliberately a report and not a gate:
+# it depends on network calls to third-party registries, and a merge gate that
+# fails because someone else published a release is a gate that teaches people
+# to ignore gates.
+#
+# It exists because pinning is not the same as pinning to something current.
+# This project once ran Pocket ID 1.16.0 for weeks under an innocent-looking
+# `:v1` tag while 2.12.0 was out — a stale pin reads as a deliberate one, which
+# is worse than no pin at all. Run this before any release, and when adding a
+# dependency.
+outdated:
+	@echo "== Go modules with newer versions =="
+	@$(GO) list -m -u -f '{{if .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{end}}' all \
+		| grep . || echo "  all current"
+	@echo
+	@echo "== pinned container images (tag shown is what the digest resolved from) =="
+	@# The tag comment sits on the same line in compose/ci and on the line
+	@# above in a Dockerfile, because # is not a comment inside FROM. Both are
+	@# reported: an image this misses is an image nobody rechecks, which is the
+	@# exact failure this target exists for.
+	@grep -rh -B1 '@sha256:' Dockerfile compose.yaml .github/workflows/ci.yml \
+		| grep -oE '#[[:space:]]*[a-z0-9][a-z0-9./:-]*$$' \
+		| sed -E 's/#[[:space:]]*//' | sort -u | sed 's/^/  /'
+	@echo
+	@echo "  authoritative sources:"
+	@echo "    pocket-id   https://github.com/pocket-id/pocket-id/releases/latest"
+	@echo "    postgres    https://hub.docker.com/_/postgres/tags?name=alpine"
+	@echo "    golang      https://hub.docker.com/_/golang/tags?name=alpine"
+	@echo "    distroless  https://github.com/GoogleContainerTools/distroless"
+	@echo "    actions     gh api repos/actions/<name>/releases/latest --jq .tag_name"
 
 clean:
 	rm -rf bin

@@ -26,7 +26,7 @@
 # what pulls. Update digests deliberately, the way action SHAs are updated.
 services:
   db:
-    image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 # 17-alpine
+    image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 # 18.4-alpine
     environment:
       POSTGRES_USER: portal
       POSTGRES_PASSWORD: portal
@@ -37,13 +37,23 @@ services:
       timeout: 2s
       retries: 30
     volumes:
-      - db-data:/var/lib/postgresql/data
+      # Postgres 18+ images store data in a major-version-specific
+      # subdirectory, so the mount belongs one level up at
+      # /var/lib/postgresql. Mounting the old .../data path makes the image
+      # refuse to start — which is the correct refusal: it cannot tell a
+      # deliberate layout from an image upgraded without pg_upgrade. The
+      # single higher mount is also what makes a future pg_upgrade --link
+      # possible without crossing a mount boundary.
+      - db-data:/var/lib/postgresql
 
   pocket-id:
-    image: ghcr.io/pocket-id/pocket-id@sha256:f8cde808e8e840acda25683fc2168e0206e3f3fb1a48cca89d211aafd87eaeef # v1 (1.16.0)
+    image: ghcr.io/pocket-id/pocket-id@sha256:4a277d141d6069fd9a7b321a9aca80f4b9812b8fa122ee566d2f15900e3d8448 # v2.12.0
     environment:
       APP_URL: http://pocket-id.localhost:1411
       TRUST_PROXY: "false"
+      # Mandatory from Pocket ID v2: it encrypts its own secrets at rest, and
+      # refuses to start without a key of at least 16 characters.
+      ENCRYPTION_KEY: ${POCKET_ID_ENCRYPTION_KEY:?set in .env — see .env.example}
     ports:
       - "1411:1411"
     volumes:

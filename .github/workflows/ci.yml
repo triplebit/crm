@@ -39,7 +39,7 @@ jobs:
       postgres:
         # Digest-pinned like every other image in this project; the tag is
         # what the digest resolved from.
-        image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 # 17-alpine
+        image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 # 18.4-alpine
         env:
           POSTGRES_USER: portal
           POSTGRES_PASSWORD: portal

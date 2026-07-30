@@ -2,7 +2,7 @@
 # Images are digest-pinned like everything else that executes in this project;
 # the tag each digest resolved from is named in the comment above it, because
 # a # is not a comment inside a FROM line.
-# golang:1.26-alpine
+# golang:1.26.5-alpine
 FROM golang@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -20,8 +20,8 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # Runtime stage. Distroless static: no shell, no package manager, no root.
 # The healthcheck is the portal binary probing itself, because there is no
 # curl in here and there should not be.
-# gcr.io/distroless/static-debian12:nonroot
-FROM gcr.io/distroless/static-debian12@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
+# gcr.io/distroless/static-debian13:nonroot
+FROM gcr.io/distroless/static-debian13@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 COPY --from=build /portal /portal
 ENTRYPOINT ["/portal"]
 CMD ["serve"]

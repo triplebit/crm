@@ -115,3 +115,21 @@ data binds record id and field name. **Consequence.** One codec, in the lowest
 layer that can hold it; the private helper is deleted. Copying an envelope
 between orders or between fields still fails authentication, which was the
 original point.
+
+## D11 — pins are verified against upstream, not remembered
+
+**Context.** Every image and action in this project is digest- or SHA-pinned,
+for good reasons recorded above. But pinning says nothing about currency, and a
+stale pin reads as a deliberate choice: this project ran Pocket ID 1.16.0
+behind an innocent-looking `:v1` major tag while 2.12.0 was current, because
+the tag was chosen from memory rather than checked. A floating tag is at least
+honestly out of date; a pinned stale version looks reviewed.
+**Decision.** Version numbers come from authoritative sources — the project's
+releases page, the registry's tag list, the module proxy — never from memory,
+and `make outdated` reports drift on demand. It is a report, not a merge gate,
+because a gate that fails when a third party publishes a release teaches people
+to ignore gates. **Consequence.** Upgrades are deliberate and dated. The
+Pocket ID v1→v2 jump this rule produced also surfaced two breaking changes that
+only running the software reveals: v2 requires its own `ENCRYPTION_KEY`, and
+the Postgres 18 image moved its data directory, refusing to start against the
+old mount rather than silently ignoring it.
