@@ -16,6 +16,8 @@
 package stripetest
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -30,6 +32,11 @@ import (
 type Server struct {
 	mu sync.Mutex
 
+	// prefix makes every identifier this instance mints globally unique:
+	// tests share one PostgreSQL, whose unique indexes on Stripe identifiers
+	// would otherwise collide across tests that each run their own fake.
+	prefix string
+
 	server    *httptest.Server
 	byIdem    map[string]map[string]any
 	byIdemErr map[string]int // idempotency key → cached error status
@@ -37,6 +44,7 @@ type Server struct {
 	products  map[string]map[string]any
 
 	customers       map[string]map[string]any
+	sessions        map[string]map[string]any
 	customerOrigin  map[string]string // customer id → acct that created it
 	customerReads   map[string]int    // customer id + "|" + acct → reads so far
 	propagationLag  int               // sibling-account reads that 404 first
@@ -52,12 +60,16 @@ type Server struct {
 // New starts a fake Stripe server; it stops with the test.
 func New(t *testing.T) *Server {
 	t.Helper()
+	raw := make([]byte, 4)
+	_, _ = rand.Read(raw)
 	f := &Server{
+		prefix:         hex.EncodeToString(raw),
 		byIdem:         map[string]map[string]any{},
 		byIdemErr:      map[string]int{},
 		prices:         map[string]map[string]any{},
 		products:       map[string]map[string]any{},
 		customers:      map[string]map[string]any{},
+		sessions:       map[string]map[string]any{},
 		customerOrigin: map[string]string{},
 		customerReads:  map[string]int{},
 	}
@@ -137,6 +149,25 @@ func (f *Server) ProductName(id string) string {
 	return ""
 }
 
+// Session returns a stored checkout session's field, or "" when absent.
+func (f *Server) Session(id, field string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if obj, ok := f.sessions[id]; ok {
+		if v, ok := obj[field].(string); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// SessionCount reports how many checkout sessions were created.
+func (f *Server) SessionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions)
+}
+
 // CustomerCount reports how many Customers exist.
 func (f *Server) CustomerCount() int {
 	f.mu.Lock()
@@ -195,7 +226,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/products":
 		f.creates++
 		obj := map[string]any{
-			"id": fmt.Sprintf("prod_%d", f.creates), "object": "product",
+			"id": fmt.Sprintf("prod_%s%d", f.prefix, f.creates), "object": "product",
 			"name": r.PostForm.Get("name"), "active": true,
 			"metadata": map[string]any{"portal_slug": r.PostForm.Get("metadata[portal_slug]")},
 		}
@@ -225,7 +256,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/prices":
 		f.creates++
 		obj := map[string]any{
-			"id": fmt.Sprintf("price_%d", f.creates), "object": "price",
+			"id": fmt.Sprintf("price_%s%d", f.prefix, f.creates), "object": "price",
 			"product":  r.PostForm.Get("product"),
 			"currency": r.PostForm.Get("currency"),
 			"active":   true,
@@ -270,13 +301,29 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		f.creates++
 		obj := map[string]any{
-			"id": fmt.Sprintf("cus_%d", f.creates), "object": "customer",
+			"id": fmt.Sprintf("cus_%s%d", f.prefix, f.creates), "object": "customer",
 			"email": r.PostForm.Get("email"), "name": r.PostForm.Get("name"),
 			"metadata": map[string]any{"portal_account_id": r.PostForm.Get("metadata[portal_account_id]")},
 		}
 		id := obj["id"].(string)
 		f.customers[id] = obj
 		f.customerOrigin[id] = context
+		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
+		respond(obj)
+
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/checkout/sessions":
+		f.creates++
+		id := fmt.Sprintf("cs_test%s%d", f.prefix, f.creates)
+		obj := map[string]any{
+			"id": id, "object": "checkout.session",
+			"url":                  f.server.URL + "/pay/" + id,
+			"mode":                 r.PostForm.Get("mode"),
+			"customer":             r.PostForm.Get("customer"),
+			"client_reference_id":  r.PostForm.Get("client_reference_id"),
+			"payment_method_types": r.PostForm["payment_method_types[0]"],
+			"expires_at":           1900000000,
+		}
+		f.sessions[id] = obj
 		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
 		respond(obj)
 

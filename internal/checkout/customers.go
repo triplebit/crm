@@ -15,13 +15,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/cryptox"
 	"triplebit.org/portal/internal/db"
+	"triplebit.org/portal/internal/repo/catalogdb"
 	"triplebit.org/portal/internal/repo/customers"
+	"triplebit.org/portal/internal/repo/orders"
 	"triplebit.org/portal/internal/stripepay"
 )
 
@@ -33,23 +37,42 @@ const (
 	propagationPoll = 500 * time.Millisecond
 )
 
+// pendingLine pairs a catalog item with the verified version it sells under.
+type pendingLine struct {
+	item     catalogdb.Item
+	version  catalogdb.PriceVersion
+	quantity int
+}
+
 // Service is the checkout orchestrator.
 type Service struct {
 	customers *customers.Repo
+	orders    *orders.Repo
+	catalog   *catalogdb.Repo
 	pool      *db.Pool
 	pay       *stripepay.Client
+	keys      *cryptox.Keyring
 	env       core.StripeEnvironment
+	baseURL   string
 	now       func() time.Time
 	sleep     func(context.Context, time.Duration) error
 }
 
-// Options configures the service. Everything is required except Now.
+// Options configures the service. Everything is required except Now and
+// Sleep.
 type Options struct {
 	Customers   *customers.Repo
+	Orders      *orders.Repo
+	Catalog     *catalogdb.Repo
 	Pool        *db.Pool
 	Pay         *stripepay.Client
+	Keys        *cryptox.Keyring
 	Environment core.StripeEnvironment
-	Now         func() time.Time
+
+	// BaseURL is the portal's public origin, for Checkout's return URLs.
+	BaseURL string
+
+	Now func() time.Time
 
 	// Sleep is the propagation-poll wait; tests replace it. Nil means real
 	// context-aware sleeping.
@@ -61,12 +84,20 @@ func New(opts Options) (*Service, error) {
 	switch {
 	case opts.Customers == nil:
 		return nil, errors.New("checkout: a customers repository is required")
+	case opts.Orders == nil:
+		return nil, errors.New("checkout: an orders repository is required")
+	case opts.Catalog == nil:
+		return nil, errors.New("checkout: a catalog repository is required")
 	case opts.Pool == nil:
 		return nil, errors.New("checkout: a database pool is required")
 	case opts.Pay == nil:
 		return nil, errors.New("checkout: a Stripe client is required")
+	case opts.Keys == nil:
+		return nil, errors.New("checkout: the PII keyring is required")
 	case opts.Environment.IsZero():
 		return nil, errors.New("checkout: a Stripe environment is required")
+	case opts.BaseURL == "":
+		return nil, errors.New("checkout: a base URL is required")
 	}
 	now := opts.Now
 	if now == nil {
@@ -87,9 +118,13 @@ func New(opts Options) (*Service, error) {
 	}
 	return &Service{
 		customers: opts.Customers,
+		orders:    opts.Orders,
+		catalog:   opts.Catalog,
 		pool:      opts.Pool,
 		pay:       opts.Pay,
+		keys:      opts.Keys,
 		env:       opts.Environment,
+		baseURL:   strings.TrimRight(opts.BaseURL, "/"),
 		now:       now,
 		sleep:     sleep,
 	}, nil

@@ -10,8 +10,11 @@ import (
 
 	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/cryptox"
 	"triplebit.org/portal/internal/db"
+	"triplebit.org/portal/internal/repo/catalogdb"
 	"triplebit.org/portal/internal/repo/customers"
+	"triplebit.org/portal/internal/repo/orders"
 	"triplebit.org/portal/internal/stripepay"
 	"triplebit.org/portal/internal/stripetest"
 	"triplebit.org/portal/internal/testdb"
@@ -21,8 +24,8 @@ func newService(t *testing.T, fake *stripetest.Server) (*checkout.Service, *db.P
 	t.Helper()
 	pool := testdb.Pool(t)
 	pay, err := stripepay.New(stripepay.Options{
-		APIKey:               "sk_test_checkout",
-		Environment:          core.StripeSandbox,
+		APIKey:               "rk_live_checkouttest",
+		Environment:          core.StripeProduction,
 		MembershipsAccountID: "acct_m1",
 		DonationsAccountID:   "acct_d1",
 		BaseURL:              fake.URL(),
@@ -30,11 +33,23 @@ func newService(t *testing.T, fake *stripetest.Server) (*checkout.Service, *db.P
 	if err != nil {
 		t.Fatalf("stripepay.New: %v", err)
 	}
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 50)
+	}
+	ring, err := cryptox.NewKeyring("pii-test", map[string][]byte{"pii-test": key})
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
 	svc, err := checkout.New(checkout.Options{
 		Customers:   customers.New(),
+		Orders:      orders.New(),
+		Catalog:     catalogdb.New(),
 		Pool:        pool,
 		Pay:         pay,
-		Environment: core.StripeSandbox,
+		Keys:        ring,
+		Environment: core.StripeProduction,
+		BaseURL:     "http://portal.test",
 		// Tests never really sleep; the fake's propagation is counted in
 		// reads, not time.
 		Sleep: func(context.Context, time.Duration) error { return nil },
@@ -144,7 +159,7 @@ func TestEnsureCustomerResumesFromARecordedIntent(t *testing.T) {
 	person := seedPerson(t, pool)
 	repo := customers.New()
 
-	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships, person.Email, person.Name)
+	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeProduction, core.Memberships, person.Email, person.Name)
 	if err != nil {
 		t.Fatalf("EnsureIntent: %v", err)
 	}
@@ -165,7 +180,7 @@ func TestEnsureCustomerResumesFromARecordedIntent(t *testing.T) {
 
 	// The resume must also repair the origin projection the crash skipped —
 	// otherwise this person consults the intent on every request forever.
-	stored, err := repo.CustomerIDFor(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships)
+	stored, err := repo.CustomerIDFor(ctx, pool.Conn(), person.UserID, core.StripeProduction, core.Memberships)
 	if err != nil || stored != "cus_fromthecrash" {
 		t.Fatalf("origin projection after resume = %q (%v), want cus_fromthecrash", stored, err)
 	}
@@ -192,13 +207,13 @@ func TestStaleUnresolvedIntentAdoptsTheExistingCustomer(t *testing.T) {
 	// The crash: the intent was recorded and the Customer created remotely,
 	// but the result was never persisted. (Created directly against the
 	// fake, carrying the metadata the reconciliation searches by.)
-	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships, person.Email, person.Name)
+	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeProduction, core.Memberships, person.Email, person.Name)
 	if err != nil {
 		t.Fatalf("EnsureIntent: %v", err)
 	}
 	pay, err := stripepay.New(stripepay.Options{
-		APIKey:               "sk_test_checkout",
-		Environment:          core.StripeSandbox,
+		APIKey:               "rk_live_checkouttest",
+		Environment:          core.StripeProduction,
 		MembershipsAccountID: "acct_m1",
 		DonationsAccountID:   "acct_d1",
 		BaseURL:              fake.URL(),

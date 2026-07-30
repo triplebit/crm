@@ -251,3 +251,19 @@ func (r *Repo) DeactivateItem(ctx context.Context, q db.Conn, id uuid.UUID) erro
 	}
 	return nil
 }
+
+// ItemBySlug returns one item, active or not — the caller decides what an
+// inactive item means for its flow. db.ErrNotFound when the slug is unknown.
+func (r *Repo) ItemBySlug(ctx context.Context, q db.Conn, slug string) (Item, error) {
+	var out Item
+	err := q.QueryRow(ctx, `
+		SELECT id, slug, name, kind, program,
+		       requires_shipping, requires_imei, inventory_tracked, active
+		FROM catalog_items WHERE slug = $1
+	`, slug).Scan(&out.ID, &out.Slug, &out.Name, &out.Kind, &out.Program,
+		&out.RequiresShipping, &out.RequiresIMEI, &out.InventoryTracked, &out.Active)
+	if err != nil {
+		return Item{}, fmt.Errorf("catalogdb: item %q: %w", slug, db.Normalize(err))
+	}
+	return out, nil
+}
