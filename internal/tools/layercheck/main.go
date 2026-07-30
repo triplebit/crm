@@ -17,8 +17,16 @@
 //	R3  No internal/repo/X may import internal/repo/Y. Cross-aggregate work is
 //	    composed in a service, inside one transaction. repo/audit is the single
 //	    exception: one append-only table, no reads.
-//	R4  web/view may import only internal/web/viewdata, so templates cannot
-//	    reach a service, a repository or the Stripe client.
+//	R4  web/view (and any subpackage) may import only internal/web/viewdata,
+//	    so templates cannot reach a service, a repository or the Stripe client.
+//	R5  stripe-go is importable only by internal/stripepay. Every other
+//	    package talks to Stripe through that wrapper, which is where the
+//	    response size cap, the context requirement and the idempotency-key
+//	    discipline live.
+//
+// The tool also refuses to bless an implausibly small module: run from a
+// subdirectory, `go list ./...` sees a fraction of the packages and every rule
+// passes vacuously. The binary package must be present or the run fails.
 //
 // Usage: go run ./internal/tools/layercheck
 package main
@@ -110,6 +118,18 @@ var layers = map[string]int{
 // repoAuditPkg is the one repository other repositories may import.
 const repoAuditPkg = "internal/repo/audit"
 
+// stripeModule is the dependency R5 confines, and stripeWrapperPkg is the one
+// package allowed to import it.
+const (
+	stripeModule     = "github.com/stripe/stripe-go"
+	stripeWrapperPkg = "internal/stripepay"
+)
+
+// anchorPkg must appear in every scan. Its absence means the tool was run
+// somewhere that cannot see the whole module, and a partial scan that passes
+// is worse than no scan.
+const anchorPkg = "cmd/portal"
+
 type pkg struct {
 	ImportPath   string
 	Imports      []string
@@ -124,7 +144,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	problems := check(pkgs, layers)
+	problems := append(assertComplete(pkgs), check(pkgs, layers)...)
 	if len(problems) > 0 {
 		sort.Strings(problems)
 		fmt.Fprintf(os.Stderr, "layercheck: %d layering violation(s)\n\n", len(problems))
@@ -141,12 +161,42 @@ func main() {
 // check returns one message per violation, or nil when the graph is clean. It is
 // separated from main so the rules themselves are unit-testable: an enforcement
 // tool that has never been observed to fail is not known to work.
+// assertComplete refuses a scan that cannot see the whole module. Run from a
+// subdirectory, `go list ./...` returns a fraction of the packages and every
+// rule passes vacuously — "0 packages, layering clean" is a failure mode, not
+// a success.
+func assertComplete(pkgs []pkg) []string {
+	for _, p := range pkgs {
+		if trimModule(p.ImportPath) == anchorPkg {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf(
+		"%s is not in the scan. Run layercheck from the module root: a partial scan passes every rule vacuously.",
+		anchorPkg)}
+}
+
 func check(pkgs []pkg, layers map[string]int) []string {
 	var problems []string
+
 	for _, p := range pkgs {
 		local := trimModule(p.ImportPath)
 		if local == "" {
 			continue
+		}
+
+		// R5: only the wrapper touches stripe-go. Checked against the raw
+		// import path because third-party imports are otherwise invisible to
+		// this tool — which is exactly how a rule like "catalog never imports
+		// the Stripe client" would erode.
+		if local != stripeWrapperPkg {
+			for _, imp := range p.Imports {
+				if strings.HasPrefix(imp, stripeModule) {
+					problems = append(problems, fmt.Sprintf(
+						"%s imports %s: Stripe is reached only through %s",
+						local, imp, stripeWrapperPkg))
+				}
+			}
 		}
 		from, known := layers[local]
 		if !known {
@@ -184,10 +234,13 @@ func check(pkgs []pkg, layers map[string]int) []string {
 					local, to))
 			}
 
-			// R4: templates see formatted data and nothing else.
-			if local == "web/view" && to != "internal/web/viewdata" {
+			// R4: templates see formatted data and nothing else. A prefix
+			// match, so a future web/view/email or web/view/pdf cannot slip
+			// out from under the rule by being a subpackage.
+			if (local == "web/view" || strings.HasPrefix(local, "web/view/")) &&
+				to != "internal/web/viewdata" {
 				problems = append(problems, fmt.Sprintf(
-					"web/view imports %s: templates may import only internal/web/viewdata", to))
+					"%s imports %s: templates may import only internal/web/viewdata", local, to))
 			}
 		}
 	}

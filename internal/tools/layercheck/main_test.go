@@ -11,6 +11,7 @@ var testLayers = map[string]int{
 	"internal/leaf":         0,
 	"internal/core":         10,
 	"internal/db":           20,
+	"internal/stripepay":    20,
 	"internal/repo/audit":   25,
 	"internal/repo/orders":  30,
 	"internal/repo/billing": 30,
@@ -18,6 +19,7 @@ var testLayers = map[string]int{
 	"internal/staff":        40, // a same-layer sibling of checkout
 	"internal/web/viewdata": 45,
 	"web/view":              50,
+	"web/view/email":        50, // a template subpackage; R4 must cover it too
 	"internal/web":          60,
 }
 
@@ -132,5 +134,42 @@ func TestRealLayerMapListsTheModuleRoot(t *testing.T) {
 		if layer < 0 {
 			t.Errorf("package %q has negative layer %d", name, layer)
 		}
+	}
+}
+
+// R4 is a prefix rule: a template subpackage must not slip out from under it
+// by not being the exact string "web/view".
+func TestTemplateSubpackagesAreCoveredByR4(t *testing.T) {
+	pkgs := []pkg{newPkg("web/view/email", "internal/core")}
+	assertOneProblemContaining(t, check(pkgs, testLayers), "only internal/web/viewdata")
+}
+
+// R5: stripe-go is a third-party import, invisible to the layer numbers, so it
+// gets its own rule. Only the wrapper may import it.
+func TestStripeIsReachableOnlyThroughTheWrapper(t *testing.T) {
+	direct := pkg{
+		ImportPath: mod("internal/checkout"),
+		Imports:    []string{"github.com/stripe/stripe-go/v86", "context"},
+	}
+	assertOneProblemContaining(t, check([]pkg{direct}, testLayers), "only through internal/stripepay")
+
+	wrapper := pkg{
+		ImportPath: mod("internal/stripepay"),
+		Imports:    []string{"github.com/stripe/stripe-go/v86", "context"},
+	}
+	if problems := check([]pkg{wrapper}, testLayers); len(problems) != 0 {
+		t.Errorf("the wrapper itself was refused stripe-go: %q", problems)
+	}
+}
+
+// A scan that cannot see the binary package is a partial scan, and a partial
+// scan that passes is the tool failing open.
+func TestPartialScanIsRefused(t *testing.T) {
+	pkgs := []pkg{newPkg("internal/core", "internal/leaf")}
+	assertOneProblemContaining(t, assertComplete(pkgs), "module root")
+
+	withAnchor := append(pkgs, newPkg("cmd/portal"))
+	if problems := assertComplete(withAnchor); len(problems) != 0 {
+		t.Errorf("a complete scan was refused: %q", problems)
 	}
 }

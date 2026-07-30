@@ -7,8 +7,12 @@
 # noticed.
 #
 # Therefore: no `continue-on-error`, no `|| true`, no advisory steps in this
-# file. A step here either gates the merge or does not belong here. Scanners live
-# in a separate workflow and may stay advisory; they must never be the only one.
+# file. A step here either gates the merge or does not belong here — including
+# the vulnerability scan, which is a gate, not an advisory sidecar.
+#
+# Every gating step is `make <target>`. CI re-typing the gates is how CI and
+# the local check drift apart, which happened once: CI ran `go build ./...`
+# while make built one binary, and six targets never ran in CI at all.
 name: CI
 
 on:
@@ -44,11 +48,12 @@ jobs:
           --health-retries 10
 
     env:
-      PORTAL_TEST_DATABASE_URL: postgres://portal:portal@127.0.0.1:5432/portal_test?sslmode=disable
-      # Turns internal/testdb's t.Skip into t.Fatal. A database test that
-      # silently skips in CI is not a test: that is exactly how four integration
-      # tests stayed red from the baseline commit onward.
-      PORTAL_REQUIRE_DB_TESTS: "1"
+      # make test-db derives PORTAL_TEST_DATABASE_URL from this and sets
+      # PORTAL_REQUIRE_DB_TESTS=1 itself, turning internal/testdb's t.Skip
+      # into a failure. A database test that silently skips in CI is not a
+      # test: that is exactly how four integration tests stayed red from the
+      # baseline commit onward.
+      TEST_DB_URL: postgres://portal:portal@127.0.0.1:5432/portal_test?sslmode=disable
 
     # Actions are pinned to full-length commit SHAs, not tags. A tag is mutable:
     # whoever controls the action's repository can repoint it at new code, which
@@ -63,33 +68,44 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Generated templates are committed so `go build` works without codegen.
-      # This proves they are current, using the templ version pinned by go.mod's
-      # tool directive rather than a separately pinned binary.
-      - name: templ generate
-        run: go tool templ generate
-
       - name: generated templates are current
-        run: git diff --exit-code -- '*_templ.go'
+        run: make generate-check
 
       - name: gofmt
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "gofmt needed on:"; echo "$out"; exit 1
-          fi
-
-      - name: go build
-        run: go build ./...
+        run: make fmt-check
 
       - name: go vet
-        run: go vet ./...
+        run: make vet
 
       - name: layering
-        run: go run ./internal/tools/layercheck
+        run: make layercheck
 
       - name: cookies are written through internal/cookie only
         run: make lint-cookie
 
-      - name: go test
-        run: go test -race -count=1 ./...
+      # An enforcement mechanism that has never been observed to fail is not
+      # known to work. Plant a known-bad file and require the lint to catch it.
+      - name: the cookie lint can fail
+        run: |
+          echo 'package httpx' > internal/httpx/zz_lint_probe.go
+          echo 'import "net/http"' >> internal/httpx/zz_lint_probe.go
+          echo 'func zzProbe(w http.ResponseWriter) { w.Header().Set("Set-Cookie", "x=1") }' >> internal/httpx/zz_lint_probe.go
+          if make lint-cookie; then
+            echo "lint-cookie passed a known-bad probe"; exit 1
+          fi
+          rm internal/httpx/zz_lint_probe.go
+
+      - name: module graph is verified and tidy
+        run: make mod-verify
+
+      - name: go build
+        run: make build
+
+      - name: go test (database tests must run, not skip)
+        run: make test-db
+
+      - name: govulncheck
+        run: make vuln
+
+      - name: compose file is valid
+        run: make compose-check

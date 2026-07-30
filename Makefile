@@ -7,16 +7,19 @@ GO ?= go
 TEST_DB_PORT ?= 55432
 TEST_DB_URL  ?= postgres://portal:portal@127.0.0.1:$(TEST_DB_PORT)/portal_test?sslmode=disable
 
-# Every target here also runs in CI, and CI runs no target that is not here.
-# When the two drift, the local check stops meaning anything.
+# CI runs no gate that is not a target in this file — every gating step in
+# ci.yml is `make <target>` — so the local check and the merge gate cannot
+# drift apart. (The reverse does not hold: db-up, clean and friends are local
+# conveniences.)
 .PHONY: all check build test test-db vet fmt fmt-check generate generate-check \
-        layercheck lint-cookie db-up db-down clean
+        layercheck lint-cookie mod-verify vuln compose-check db-up db-down clean
 
 all: check
 
-# check is what a pre-push hook should run: everything CI gates on, in the order
-# that fails fastest.
-check: fmt-check generate-check vet layercheck lint-cookie build test
+# check is what a pre-push hook should run: every offline gate, in the order
+# that fails fastest. CI runs these plus test-db, vuln and compose-check,
+# which need a database, the network and docker respectively.
+check: fmt-check generate-check vet layercheck lint-cookie mod-verify build test
 
 build:
 	$(GO) build -o bin/portal ./cmd/portal
@@ -69,11 +72,40 @@ layercheck:
 # internal/cookie is the only package permitted to construct a Set-Cookie
 # header. Centralising it is what makes a __Host- prefixed cookie with a
 # non-root path unrepresentable, rather than a mistake waiting to be repeated.
+# Case-insensitive, covers .templ as well as .go, and searches every root that
+# holds code (Header().Set canonicalises "set-cookie", so casing is not a
+# boundary). grep's own errors — a renamed root, an unreadable file — land in
+# the match list via 2>&1 and fail the target, instead of an empty search
+# passing as a clean one. CI additionally proves this target can fail, by
+# planting a known-bad probe and requiring a non-zero exit.
 lint-cookie:
-	@if grep -rn --include='*.go' -e 'http.SetCookie' -e '&http.Cookie{' -e '"__Host-' -e '"Set-Cookie"' \
-		internal cmd 2>/dev/null | grep -v '^internal/cookie/'; then \
-		echo; echo "cookies must be written through internal/cookie only"; exit 1; \
+	@matches=$$(grep -rni --include='*.go' --include='*.templ' \
+		-e 'http\.SetCookie' -e 'http\.Cookie' -e '"__Host-' -e '"Set-Cookie"' \
+		internal cmd web migrations 2>&1 | grep -v '^internal/cookie/' || true); \
+	if [ -n "$$matches" ]; then \
+		echo "$$matches"; echo; echo "cookies must be written through internal/cookie only"; exit 1; \
 	fi
+
+# The module graph must be verifiable and tidy: go.sum mismatches and
+# untracked dependency edits both fail, which matters more once stripe-go
+# lands than it does today.
+mod-verify:
+	$(GO) mod verify
+	$(GO) mod tidy -diff
+
+# A merge gate, not an advisory sidecar. Pinned to a version, like everything
+# else that runs in CI; update it deliberately.
+vuln:
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+# Validates compose.yaml without starting anything. The dummy values satisfy
+# the ":?" required-variable checks, whose job is refusing a real start-up
+# without real keys — syntax validation is not a start-up.
+compose-check:
+	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
+	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+	docker compose config -q
 
 clean:
 	rm -rf bin
