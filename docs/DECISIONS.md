@@ -137,3 +137,47 @@ only running the software reveals: v2 requires its own `ENCRYPTION_KEY`, and
 the Postgres 18 image moved its data directory, refusing to start against the
 old mount rather than silently ignoring it. The volume is therefore named for
 its major version, so an upgrade never makes rollback a data-loss decision.
+
+## D12 — gates encode this project's invariants; general-purpose linters do not
+
+**Context.** Adding static analysis was proposed, so the candidate tools were run
+against this codebase rather than argued about. staticcheck 2025.1.1 (roughly 150
+analyzers, `unused` included): zero findings. errcheck: three, all writes to an
+HMAC or to stdout. errcheck `-blank`: seventy-four, of which the eleven in
+non-test code are every one a correct idiom (`defer _ = tx.Rollback`,
+`hash.Write`) and forty-two are `t.Cleanup` deletes. gosec: two, both false
+positives — `math/rand` for transaction retry jitter, reported HIGH, and
+`os.Open` of a manifest path the operator passes on the command line. nilaway did
+not finish in seven minutes.
+
+Set against the defects this project has actually had, the result is starker. Of
+roughly fourteen real ones, static analysis would have caught at most a single
+test-database leak, and only through `errcheck -blank`, whose price is
+seventy-odd annotations on correct code for a bug already fixed structurally. The
+rest were semantic: an idempotency key that omitted the account, a same-origin
+check that would have refused every Stripe delivery, a projector that wrote
+whether or not settlement succeeded, a sweep that was not scoped to its Stripe
+environment. No general tool knows those rules, because they are this portal's
+rules.
+
+**Decision.** No general-purpose linters. `go vet` stays; the gates that earn
+their place are the bespoke ones — layercheck's R1–R5, `lint-cookie`, the
+`RequireWorker` AST test, the route-registry tests, exact schema table-set
+equality, migration checksums, the compose D7 grep — because each encodes an
+invariant a general tool cannot express. New gates are held to that standard: it
+must be possible to name the defect the gate prevents.
+
+**Consequence.** Effort goes to whether our own gates still fire rather than to
+adding more. That question has already found three failures — `lint-cookie`
+matching case-sensitively, `compose-check` validating the developer's `.env`
+instead of the file under test, and layercheck's R4 sitting after a `continue`
+that made it unable to fire at all — so every gate owes a negative self-test, and
+the newest one (the worker-secret grep) is scheduled to get its own in M8.
+
+Two things this rule does not say. It is not an argument against tools in
+general: staticcheck reports nothing today and costs a three-line target, so
+anyone wanting that insurance can add it without reopening this decision. And it
+is not an argument against reviews — but a review is judged by whether it names
+defects, not by how many items it lists. The audit that prompted this decision
+was largely already discharged, while the untested half of the Stripe client's
+account-context and idempotency discipline went unmentioned by it.

@@ -248,6 +248,34 @@ selects stale rows through partial expression indexes on
 `split_part(ciphertext, '.', 2)`, and needs no cursor: re-sealing a row
 removes it from the predicate, so the query is its own resumable cursor.
 
+**Three hardening items are parked here**, from the static-analysis evaluation
+recorded as D12. None is urgent; all three are cheap, and each names a defect.
+
+1. **The Stripe client's coverage claim is false.**
+   `TestEveryCallCarriesTheAccountContext` exercises 2 of 13 remote-call methods,
+   and `TestMutationsRequireAnExplicitIdempotencyKey` 3 of 7 mutating ones —
+   leaving `CreateCustomer`, `CreateCheckoutSession`, `ExpireCheckoutSession` and
+   `UpdateProductName` untested for both invariants. A test named `EveryCall` that
+   covers two is worse than none, because it misleads the next reader. Replace both
+   with one test gated on `reflect.TypeOf((*Client)(nil)).NumMethod()`, so a
+   fourteenth method fails until someone classifies it. Two traps found while
+   planning: classify mutations by the HTTP verb the fake observed, never by a Go
+   signature (a mutating method that takes *no* key is the defect to catch, and it
+   has no signature to match); and do not call methods with zero-valued arguments,
+   because `CreateProduct`, `CreatePrice` and `CreateCheckoutSession` validate
+   their spec *before* `mutationParams`, so a naive "error and no request" test
+   would pass vacuously on three of the seven. Since R5 keeps every Stripe call in
+   this package, this one test covers all future money code.
+2. **The worker-secret compose guard has no self-test.** It extracts the `worker:`
+   block with awk; if that pattern stops matching — the service renamed, or
+   `docker compose config` changing its indentation — grep matches nothing and the
+   gate passes silently. It guards D7. Add a probe mirroring the cookie-lint
+   meta-gate: plant a PII key in that block and require `make compose-check` to
+   fail.
+3. `migrations/schema_postgres_test.go:398` deletes orders with the error
+   discarded, which works only because that test seeds no `order_lines`. Route it
+   through `testdb.PurgeOrders`.
+
 ### M9 — tax acknowledgments
 
 Deliberately last, because acknowledgments are a downstream projection of
