@@ -1,0 +1,22 @@
+# The previous implementation, kept locally as a reference only. It carries its
+# own git history and is deliberately not part of this repository.
+/OLD/
+
+# Local tooling state (AgentsRoom desktop, machine-specific absolute paths).
+/.agentsroom/
+/.mcp.json
+/.claude/
+
+# Secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# Build output.
+/bin/
+
+# Node is used at build time only, to compile Tailwind CSS.
+/node_modules/
+/.pnpm-store/
+
+.DS_Store
