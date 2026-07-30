@@ -178,10 +178,13 @@ different machine, with the keyring, proven by a member signing in and reading
 their own settled order. Until that has happened once, the recovery posture is
 unknown.
 
-Before M5 writes the first PII ciphertext (`orders.imei_ciphertext`), settle
-the rotation design: a key-id column beside each ciphertext and a resumable
-rotation cursor, so `rotate-pii` can select rows instead of full-scanning. The
-first write freezes the representation.
+The rotation design was settled before M5's first ciphertext write (migration
+000003): every ciphertext column holds the cryptox text envelope, whose
+embedded key id is the *only* copy of that fact — a key-id column would be
+the duplicated-fact bug that broke sessions, wearing a new hat. `rotate-pii`
+selects stale rows through partial expression indexes on
+`split_part(ciphertext, '.', 2)`, and needs no cursor: re-sealing a row
+removes it from the predicate, so the query is its own resumable cursor.
 
 ### M9 — tax acknowledgments
 

@@ -349,3 +349,56 @@ func seedCatalogItem(t *testing.T, ctx context.Context, pool *db.Pool) uuid.UUID
 	})
 	return id
 }
+
+// Migration 000003: ciphertext columns hold cryptox text envelopes, the shape
+// is enforced, and rotation can select rows by the key id embedded in the
+// envelope — with no key_id column to disagree with it.
+func TestCiphertextColumnsEnforceEnvelopesAndSupportRotationSelection(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	// One pending membership order per user is itself a schema rule, so each
+	// order here belongs to its own user.
+	insert := func(id uuid.UUID, envelope string) error {
+		userID := seedUser(t, ctx, pool)
+		_, err := pool.Conn().Exec(ctx, `
+			INSERT INTO orders (id, user_id, program, environment, account_ref,
+			                    state, currency, imei_ciphertext, idempotency_key)
+			VALUES ($1, $2, 'hotspot', 'sandbox', 'memberships',
+			        'draft', 'usd', $3, $4)
+		`, id, userID, envelope, id.String())
+		return err
+	}
+
+	if err := insert(uuid.New(), "not an envelope"); err == nil {
+		t.Fatal("a non-envelope ciphertext was accepted")
+	}
+
+	oldKey, newKey := uuid.New(), uuid.New()
+	if err := insert(oldKey, "v1.pii-v1.AAAA"); err != nil {
+		t.Fatalf("insert old-key envelope: %v", err)
+	}
+	if err := insert(newKey, "v1.pii-v2.BBBB"); err != nil {
+		t.Fatalf("insert new-key envelope: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Conn().Exec(context.Background(),
+			`DELETE FROM orders WHERE id IN ($1, $2)`, oldKey, newKey)
+	})
+
+	// The rotate-pii selection: rows sealed under anything but the active
+	// key. Re-sealing removes a row from this predicate, which is what makes
+	// the query its own resumable cursor.
+	var stale int
+	if err := pool.Conn().QueryRow(ctx, `
+		SELECT count(*) FROM orders
+		WHERE imei_ciphertext IS NOT NULL
+		  AND split_part(imei_ciphertext, '.', 2) <> 'pii-v2'
+		  AND id IN ($1, $2)
+	`, oldKey, newKey).Scan(&stale); err != nil {
+		t.Fatalf("rotation selection: %v", err)
+	}
+	if stale != 1 {
+		t.Errorf("rotation selection found %d stale rows, want exactly the pii-v1 one", stale)
+	}
+}
