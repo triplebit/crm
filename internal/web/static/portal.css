@@ -1,0 +1,94 @@
+/* Hand-written, deliberately small. The stack decision names Tailwind; its
+ * build step (standalone CLI, content scanning of .templ files, a drift check
+ * in CI) buys nothing while the portal has three pages, so it arrives with the
+ * catalog UI in M4. Everything here is scoped to the classes the templates
+ * use, so swapping it out later is deletion, not migration. CSP forbids inline
+ * styles, which is why this file exists at all. */
+
+:root {
+  --ink: #1a1f24;
+  --muted: #5c6670;
+  --paper: #f7f7f5;
+  --card: #ffffff;
+  --accent: #0f5f3f;
+  --accent-ink: #ffffff;
+  --line: #e2e2de;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  line-height: 1.5;
+}
+
+header.site {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.25rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+}
+
+header.site .brand {
+  font-weight: 650;
+  text-decoration: none;
+  color: var(--ink);
+}
+
+header.site nav {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+header.site .user { color: var(--muted); }
+
+header.site form { margin: 0; }
+
+button, .button {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  font: inherit;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+main {
+  max-width: 40rem;
+  margin: 3rem auto;
+  padding: 0 1.25rem;
+}
+
+.hero { text-align: center; }
+.hero h1 { margin-bottom: 0.25rem; }
+.hero p { color: var(--muted); margin-top: 0; }
+.hero .button { margin-top: 1rem; }
+
+.notice {
+  padding: 0.6rem 1rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.account dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 1.5rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.25rem;
+}
+
+.account dt { color: var(--muted); }
+.account dd { margin: 0; }

@@ -1,0 +1,38 @@
+// Package view renders every page. It may import only viewdata (layercheck
+// R4), so nothing here can reach a service, a repository or Stripe: templates
+// receive pre-formatted strings and lay them out.
+package view
+
+import "triplebit.org/portal/internal/web/viewdata"
+
+templ page(l viewdata.Layout) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ l.Title } · { l.BrandName }</title>
+			<link rel="stylesheet" href="/static/portal.css"/>
+		</head>
+		<body>
+			<header class="site">
+				<a class="brand" href="/">{ l.BrandName }</a>
+				if l.SignedIn {
+					<nav>
+						<span class="user">{ l.UserName }</span>
+						// The one mutating action every page carries. Sign-out is a
+						// POST with a CSRF token, never a link: a GET that changes
+						// state can be triggered by an <img src>.
+						<form method="post" action="/logout">
+							<input type="hidden" name="_csrf" value={ l.CSRFToken }/>
+							<button type="submit">Sign out</button>
+						</form>
+					</nav>
+				}
+			</header>
+			<main>
+				{ children... }
+			</main>
+		</body>
+	</html>
+}

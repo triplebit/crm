@@ -1,0 +1,29 @@
+package view
+
+import "triplebit.org/portal/internal/web/viewdata"
+
+templ Account(d viewdata.Account) {
+	@page(d.Layout) {
+		<section class="account">
+			<h1>{ d.DisplayName }</h1>
+			<dl>
+				<dt>Email</dt>
+				<dd>{ d.Email }</dd>
+				<dt>Signed in with</dt>
+				<dd>{ d.LoginMethod }</dd>
+				if len(d.Roles) > 0 {
+					<dt>Staff roles</dt>
+					<dd>
+						for i, role := range d.Roles {
+							if i > 0 {
+								, { role }
+							} else {
+								{ role }
+							}
+						}
+					</dd>
+				}
+			</dl>
+		</section>
+	}
+}

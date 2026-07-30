@@ -1,0 +1,20 @@
+package view
+
+import "triplebit.org/portal/internal/web/viewdata"
+
+templ Home(d viewdata.Home) {
+	@page(d.Layout) {
+		<section class="hero">
+			<h1>{ d.BrandName }</h1>
+			<p>{ d.BrandTagline }</p>
+			if d.Notice != "" {
+				<p class="notice">{ d.Notice }</p>
+			}
+			if !d.SignedIn {
+				<a class="button" href="/login">Sign in</a>
+			} else {
+				<a class="button" href="/account">Your account</a>
+			}
+		</section>
+	}
+}

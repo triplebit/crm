@@ -1,0 +1,232 @@
+package web
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"triplebit.org/portal/internal/auth"
+	"triplebit.org/portal/internal/cookie"
+	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/cryptox"
+	"triplebit.org/portal/internal/csrf"
+	"triplebit.org/portal/internal/httpx"
+	"triplebit.org/portal/internal/repo/accounts"
+	"triplebit.org/portal/internal/testdb"
+)
+
+// These tests iterate the route REGISTRY, not a hand-written list of paths.
+// A new mutating route is covered the moment it is registered; there is no
+// second list to forget to update. They construct the Server directly rather
+// than through New, so no OIDC discovery is needed — the property under test
+// is the registrar, which is the only way a route can exist.
+
+func newTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	pool := testdb.Pool(t)
+	repo := accounts.New()
+
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 100)
+	}
+	ring, err := cryptox.NewKeyring("web-test", map[string][]byte{"web-test": key})
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	sessions, err := auth.NewSessions(auth.SessionOptions{
+		Repo: repo, Pool: pool, Keys: ring,
+		IdleTTL: 30 * time.Minute, AbsoluteTTL: 12 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewSessions: %v", err)
+	}
+	base, _ := url.Parse("http://portal.test")
+	jar, err := cookie.NewJar(base, core.Development)
+	if err != nil {
+		t.Fatalf("NewJar: %v", err)
+	}
+	limiter, err := httpx.NewRateLimiter(httpx.RateLimitOptions{
+		Requests: 1000, Window: time.Minute, MaxKeys: 100,
+	})
+	if err != nil {
+		t.Fatalf("NewRateLimiter: %v", err)
+	}
+
+	s := &Server{
+		mux:           http.NewServeMux(),
+		sessions:      sessions,
+		jar:           jar,
+		logger:        slog.New(slog.DiscardHandler),
+		authLimiter:   limiter,
+		sessionCookie: jar.Name("session"),
+		loginCookie:   jar.Name("login"),
+		loginTTL:      10 * time.Minute,
+		brandName:     "Test Portal",
+		brandTagline:  "Testing",
+	}
+	s.registerRoutes()
+
+	sub := "web-sub-" + uuid.New().String()
+	user, err := repo.UpsertBySubject(context.Background(), pool.Conn(), accounts.UpsertUser{
+		PocketIDSub: sub, Email: sub + "@example.test", DisplayName: "Web Member",
+		EmailVerified: true, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Conn().Exec(context.Background(), `DELETE FROM users WHERE id = $1`, user.ID)
+	})
+	token, err := sessions.Issue(context.Background(), user.ID, "passkey")
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	return s, token.String()
+}
+
+func (s *Server) do(t *testing.T, method, path, sessionToken, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *strings.Reader
+	if body == "" {
+		reader = strings.NewReader("")
+	} else {
+		reader = strings.NewReader(body)
+	}
+	r := httptest.NewRequest(method, "http://portal.test"+path, reader)
+	if body != "" {
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if sessionToken != "" {
+		// A raw Cookie header rather than http.Cookie: lint-cookie forbids
+		// constructing cookies outside internal/cookie, and a request cookie
+		// is just a header — the single-writer rule is about Set-Cookie.
+		r.Header.Set("Cookie", s.sessionCookie.String()+"="+sessionToken)
+	}
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, r)
+	return w
+}
+
+// Every route that is not a GET must have been registered with both
+// protections. This is the registry invariant D8 promises: there is no
+// registrar method that produces a mutating route without them, and this test
+// fails if one is ever added.
+func TestRegistryHasNoUnprotectedMutatingRoute(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	if len(s.routes) == 0 {
+		t.Fatal("the route registry is empty; registerRoutes did not run")
+	}
+	mutating := 0
+	for _, rt := range s.routes {
+		if rt.Method == http.MethodGet {
+			continue
+		}
+		mutating++
+		if !rt.RequiresSession {
+			t.Errorf("%s %s does not require a session", rt.Method, rt.Pattern)
+		}
+		if !rt.ValidatesCSRF {
+			t.Errorf("%s %s does not validate CSRF", rt.Method, rt.Pattern)
+		}
+	}
+	if mutating == 0 {
+		t.Fatal("no mutating routes are registered; the assertions above ran against nothing")
+	}
+}
+
+func TestEveryMutatingRouteRefusesAnonymousRequests(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	for _, rt := range s.routes {
+		if rt.Method == http.MethodGet {
+			continue
+		}
+		w := s.do(t, rt.Method, rt.Pattern, "", "")
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s without a session: status %d, want 403", rt.Method, rt.Pattern, w.Code)
+		}
+	}
+}
+
+func TestEveryMutatingRouteRefusesRequestsWithoutACSRFToken(t *testing.T) {
+	s, token := newTestServer(t)
+
+	for _, rt := range s.routes {
+		if rt.Method == http.MethodGet {
+			continue
+		}
+		// A live session and no token: the case a cross-site form submission
+		// produces, because the browser attaches cookies but the attacker
+		// cannot read the token.
+		w := s.do(t, rt.Method, rt.Pattern, token, "")
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s without a CSRF token: status %d, want 403", rt.Method, rt.Pattern, w.Code)
+		}
+
+		// A syntactically plausible but wrong token must fail identically.
+		w = s.do(t, rt.Method, rt.Pattern, token, csrf.FieldName+"=v1.YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkwYWJjZGVmZ2hpamtsbW5vcA")
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s with a wrong CSRF token: status %d, want 403", rt.Method, rt.Pattern, w.Code)
+		}
+	}
+}
+
+// The negative tests above would also pass if the router simply returned 403
+// for everything, so prove a correctly-authenticated mutation goes through.
+func TestSignOutWorksWithSessionAndToken(t *testing.T) {
+	s, token := newTestServer(t)
+
+	principal, err := s.sessions.Load(context.Background(), token)
+	if err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	csrfToken, err := csrf.Token(principal.CSRFSecret)
+	if err != nil {
+		t.Fatalf("derive token: %v", err)
+	}
+
+	w := s.do(t, http.MethodPost, "/logout", token, csrf.FieldName+"="+url.QueryEscape(csrfToken))
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("sign-out: status %d, want 303; body: %s", w.Code, w.Body.String())
+	}
+
+	// The session must actually be dead, and the cookie cleared.
+	if _, err := s.sessions.Load(context.Background(), token); err == nil {
+		t.Error("the session survived sign-out")
+	}
+	clearsCookie := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == s.sessionCookie.String() && c.MaxAge < 0 {
+			clearsCookie = true
+		}
+	}
+	if !clearsCookie {
+		t.Error("sign-out did not clear the session cookie")
+	}
+}
+
+func TestAccountRequiresASession(t *testing.T) {
+	s, token := newTestServer(t)
+
+	w := s.do(t, http.MethodGet, "/account", "", "")
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("anonymous /account: status %d, want 303 to home", w.Code)
+	}
+
+	w = s.do(t, http.MethodGet, "/account", token, "")
+	if w.Code != http.StatusOK {
+		t.Errorf("signed-in /account: status %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "Web Member") {
+		t.Error("/account does not show the member's name — the M3 gate is exactly this")
+	}
+}

@@ -29,6 +29,10 @@ type Principal struct {
 	User  accounts.User
 	Roles []string
 
+	// LoginMethod is how this session was authenticated: passkey, email or
+	// unknown. Display only; it grants nothing.
+	LoginMethod string
+
 	// CSRFSecret is the decrypted per-session secret. It never leaves the
 	// server and is never rendered; the derived token is what reaches a page.
 	CSRFSecret []byte
@@ -169,6 +173,7 @@ func (s *Sessions) Load(ctx context.Context, raw string) (Principal, error) {
 	return Principal{
 		User:          p.User,
 		Roles:         p.Roles,
+		LoginMethod:   p.Session.LoginMethod,
 		CSRFSecret:    secret,
 		sessionDigest: digest,
 	}, nil
