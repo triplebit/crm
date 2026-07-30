@@ -40,8 +40,12 @@ func main() {
 		usage(os.Stdout)
 	case "migrate":
 		err = runMigrate(context.Background(), args)
-	case "serve", "worker", "catalog-sync", "bootstrap-staff",
-		"rotate-pii", "doctor", "healthcheck":
+	case "serve":
+		err = runServe(context.Background(), args)
+	case "healthcheck":
+		err = runHealthcheck(context.Background(), args)
+	case "worker", "catalog-sync", "bootstrap-staff",
+		"rotate-pii", "doctor":
 		// Implemented in later milestones. Listed explicitly so an unimplemented
 		// subcommand reports that clearly, and a misspelling still exits 2.
 		err = fmt.Errorf("subcommand %q is not implemented yet", cmd)

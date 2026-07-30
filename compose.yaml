@@ -1,0 +1,84 @@
+# Local development stack: PostgreSQL, Pocket ID, migrations, the portal.
+#
+# One-time setup:
+#
+#   1. Add this line to /etc/hosts so your browser and the portal container
+#      agree on the issuer URL (OIDC requires one issuer for both):
+#         127.0.0.1 pocket-id
+#   2. Copy .env.example to .env and follow the comments in it.
+#   3. docker compose up -d pocket-id, open http://pocket-id:1411, finish the
+#      Pocket ID setup, create an OIDC client (callback
+#      http://localhost:8080/auth/callback), and put its ID and secret in .env.
+#   4. docker compose up
+#
+# The M3 gate: sign in through Pocket ID and land on /account showing your
+# own name, at http://localhost:8080.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: portal
+      POSTGRES_DB: portal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal -d portal"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v1
+    environment:
+      APP_URL: http://pocket-id:1411
+      TRUST_PROXY: "false"
+    ports:
+      - "1411:1411"
+    volumes:
+      - pocket-id-data:/app/data
+
+  migrate:
+    build: .
+    image: triplebit-portal
+    command: ["migrate"]
+    environment:
+      PORTAL_DATABASE_URL: postgres://portal:portal@db:5432/portal?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+
+  portal:
+    build: .
+    image: triplebit-portal
+    command: ["serve"]
+    ports:
+      - "8080:8080"
+    environment:
+      PORTAL_ENV: development
+      PORTAL_BASE_URL: http://localhost:8080
+      PORTAL_DATABASE_URL: postgres://portal:portal@db:5432/portal?sslmode=disable
+      # ":?" makes compose refuse to start on a missing value, loudly. There
+      # are no default keys, in development either: a key that ships in a
+      # repository is not a key.
+      PORTAL_SESSION_KEY: ${PORTAL_SESSION_KEY:?set in .env — see .env.example}
+      PORTAL_SESSION_KEY_ID: ${PORTAL_SESSION_KEY_ID:?set in .env}
+      PORTAL_ENCRYPTION_KEY: ${PORTAL_ENCRYPTION_KEY:?set in .env}
+      PORTAL_ENCRYPTION_KEY_ID: ${PORTAL_ENCRYPTION_KEY_ID:?set in .env}
+      PORTAL_OIDC_ISSUER: http://pocket-id:1411
+      PORTAL_OIDC_CLIENT_ID: ${PORTAL_OIDC_CLIENT_ID:?create the client in Pocket ID first}
+      PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?create the client in Pocket ID first}
+      PORTAL_OIDC_REDIRECT_URL: http://localhost:8080/auth/callback
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      pocket-id:
+        condition: service_started
+    # OIDC discovery runs at startup and Pocket ID may still be booting;
+    # restarting until it answers is simpler and more honest than a fake
+    # readiness probe.
+    restart: on-failure
+
+volumes:
+  db-data:
+  pocket-id-data:
