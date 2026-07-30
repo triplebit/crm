@@ -45,16 +45,18 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
-// expectedTables is every table 000001 creates. Naming them, rather than
-// counting them, means a failure says which table is missing or unexpected
-// instead of only that a number changed.
+// expectedTables is every table the migrations create. Naming them, rather
+// than counting them, means a failure says which table is missing or
+// unexpected instead of only that a number changed. 40 come from 000001;
+// login_transactions from 000002.
 var expectedTables = []string{
 	"acknowledgment_deliveries", "acknowledgments", "assets", "audit_events",
 	"browser_sessions", "catalog_items", "catalog_price_versions", "consents",
 	"disputes", "donations", "donor_notes", "donor_tags", "effective_groups",
 	"entitlement_projections", "financial_invalidations", "fulfillments",
 	"guest_donor_tags", "guest_donors", "hotspot_device_replacement_requirements",
-	"inventory", "inventory_reservations", "invoices", "memberships", "order_lines",
+	"inventory", "inventory_reservations", "invoices", "login_transactions",
+	"memberships", "order_lines",
 	"order_state_history", "orders", "outbox_jobs", "payment_attempts", "refunds",
 	"staff_alerts", "staff_roles", "stripe_bank_setup_attempts",
 	"stripe_customer_creation_intents", "stripe_customers",
@@ -103,8 +105,8 @@ func TestSchemaCreatesEveryExpectedTable(t *testing.T) {
 		}
 	}
 
-	if len(expectedTables) != 40 {
-		t.Errorf("expectedTables lists %d tables, want 40", len(expectedTables))
+	if len(expectedTables) != 41 {
+		t.Errorf("expectedTables lists %d tables, want 41", len(expectedTables))
 	}
 }
 
