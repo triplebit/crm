@@ -462,6 +462,13 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/checkout/sessions":
 		f.creates++
 		id := fmt.Sprintf("cs_test%s%d", f.prefix, f.creates)
+		// amount_total is derived from the line items actually submitted, not
+		// hardcoded. It used to be a flat 0, which meant no test could ever
+		// detect a money mismatch — and that is precisely why nobody noticed
+		// the projector re-read the canonical session without comparing any of
+		// the money on it. A fake that cannot produce a mismatch cannot verify
+		// a match, so line-item totals are the fake's job now.
+		total, currency := f.lineItemTotal(r)
 		obj := map[string]any{
 			"id": id, "object": "checkout.session",
 			"url":                  f.server.URL + "/pay/" + id,
@@ -472,8 +479,8 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"expires_at":           1900000000,
 			"status":               "open",
 			"payment_status":       "unpaid",
-			"currency":             "usd",
-			"amount_total":         0,
+			"currency":             currency,
+			"amount_total":         total,
 		}
 		if r.PostForm.Get("shipping_address_collection[allowed_countries][0]") != "" {
 			obj["shipping_address_collection"] = map[string]any{
@@ -562,6 +569,92 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, `{"error":{"message":"unexpected `+r.Method+` `+r.URL.Path+`"}}`, http.StatusBadRequest)
 	}
+}
+
+// lineItemTotal sums the submitted line items the way Stripe does, resolving a
+// `price` against the prices this fake has minted and reading `price_data`
+// inline for a member-chosen donation amount. It returns the total in cents and
+// the currency it saw.
+//
+// Caller holds f.mu.
+func (f *Server) lineItemTotal(r *http.Request) (int64, string) {
+	total := int64(0)
+	currency := "usd"
+	for i := 0; ; i++ {
+		prefix := fmt.Sprintf("line_items[%d]", i)
+		priceID := r.PostForm.Get(prefix + "[price]")
+		inlineAmount := r.PostForm.Get(prefix + "[price_data][unit_amount]")
+		if priceID == "" && inlineAmount == "" {
+			break // No more lines; Stripe indexes them contiguously.
+		}
+
+		quantity := int64(1)
+		if raw := r.PostForm.Get(prefix + "[quantity]"); raw != "" {
+			_, _ = fmt.Sscan(raw, &quantity)
+		}
+
+		switch {
+		case priceID != "":
+			// An unknown price contributes nothing, which shows up in a test as
+			// a total that disagrees with the order — the honest outcome for a
+			// session built on a price Stripe has never seen.
+			if price, ok := f.prices[priceID]; ok {
+				if amount, ok := price["unit_amount"].(int64); ok {
+					total += amount * quantity
+				}
+				if c, ok := price["currency"].(string); ok && c != "" {
+					currency = c
+				}
+			}
+		default:
+			var amount int64
+			_, _ = fmt.Sscan(inlineAmount, &amount)
+			total += amount * quantity
+			if c := r.PostForm.Get(prefix + "[price_data][currency]"); c != "" {
+				currency = c
+			}
+		}
+	}
+	return total, currency
+}
+
+// SeedPrice registers a price this fake will recognise, for fixtures that write
+// a catalog price version straight into the database rather than going through
+// catalog-sync.
+//
+// Such a fixture is making a claim: a version with verified_at set means "this
+// price was read back from Stripe and matched". A fixture that sets verified_at
+// for a price Stripe has never heard of is describing a state that cannot exist,
+// and it hid a real gap — the session totals computed from those phantom prices
+// were zero, which is exactly what the projector's missing money comparison
+// would have needed to notice.
+func (f *Server) SeedPrice(id string, amount int64, currency string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if currency == "" {
+		currency = "usd"
+	}
+	f.prices[id] = map[string]any{
+		"id": id, "object": "price", "active": true,
+		"unit_amount": amount, "currency": currency,
+	}
+}
+
+// SetSessionAmountTotal overrides a stored session's total, so a test can make
+// Stripe disagree with the frozen order. Nothing in the portal can cause this;
+// it exists to prove the equivalence check fires when the impossible happens.
+func (f *Server) SetSessionAmountTotal(id string, total int64, currency string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.sessions[id]
+	if !ok {
+		return false
+	}
+	obj["amount_total"] = total
+	if currency != "" {
+		obj["currency"] = currency
+	}
+	return true
 }
 
 // canonicalSignature is what Stripe compares on idempotency-key reuse: the

@@ -246,6 +246,22 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 			}
 
 		case session.PaymentStatus == "paid":
+			// Equivalence first: nothing is settled or granted until what Stripe
+			// charged matches what the order froze. This is fail-closed by
+			// choice. A false positive refuses legitimate money and pages a
+			// human, which is recoverable; a false negative grants membership for
+			// an amount nobody agreed to, which is not.
+			if mismatch := moneyMismatch(order, lines, session); mismatch != "" {
+				signal = "money does not match the order; escalated"
+				return p.billing.RaiseAlert(ctx, c, p.env, event.Account,
+					"settlement_amount_mismatch", "order:"+order.ID.String(),
+					"Stripe's charge does not match the order",
+					fmt.Sprintf("Order %s was NOT settled and nothing was granted. %s. "+
+						"Session %s. Compare the order lines against the Stripe session, "+
+						"then settle or refund by hand.",
+						order.ID, mismatch, session.ID), p.now().UTC())
+			}
+
 			settled, err := p.orders.Settle(ctx, c, order.ID,
 				session.PaymentIntentID, session.SubscriptionID, session.InvoiceID, p.now().UTC())
 			if err != nil {
@@ -348,6 +364,66 @@ func (p *Projector) write(ctx context.Context, c db.Conn, order orders.Order, se
 		}
 	}
 	return nil
+}
+
+// moneyMismatch compares what Stripe says it charged against what the order
+// froze, returning a human-readable description of the first disagreement or ""
+// when they agree.
+//
+// This is what makes the canonical re-read a control rather than a ceremony.
+// Before it existed the projector fetched the session from Stripe and then
+// settled on `payment_status == paid` alone, comparing none of the money it had
+// just gone to the trouble of reading — while the commit message called that
+// "the difference between 'Stripe says' and 'Stripe said once'". Re-reading and
+// not comparing is the same as not re-reading.
+//
+// The comparison is strict on purpose. Amounts come from the local catalog, the
+// session is created server-side from frozen lines, and this portal uses no tax,
+// no discounts and no proration — so there is no legitimate reason for these to
+// differ, and a difference means something is wrong enough to stop for. Note
+// what is NOT compared: the shipping address (never stored, per D9) and anything
+// derived from the payload rather than the canonical read.
+//
+// UNVERIFIED AGAINST LIVE STRIPE, and the M6 gate is what verifies it. In
+// subscription mode Stripe documents amount_total as the first invoice's total,
+// which for a recurring tier plus a one-time device line should be their sum —
+// but "should" is doing work in that sentence, and this check is fail-closed, so
+// being wrong about it refuses a real member's real payment. The failure is at
+// least loud and safe: nothing is granted, nothing is settled, and the alert
+// names both numbers, so the first sandbox settlement either passes or tells us
+// exactly what Stripe actually reports. Do not relax this to make a gate pass
+// without first reading the real session JSON.
+func moneyMismatch(order orders.Order, lines []orders.Line, session stripepay.CanonicalSession) string {
+	var expected int64
+	recurring := false
+	for _, line := range lines {
+		expected += line.Amount * int64(line.Quantity)
+		if line.Kind == "hotspot_tier" || line.Kind == "friends_tier" {
+			recurring = true
+		}
+	}
+
+	if session.AmountTotal != expected {
+		return fmt.Sprintf("Stripe charged %d but the order's frozen lines total %d",
+			session.AmountTotal, expected)
+	}
+	if !strings.EqualFold(session.Currency, order.Currency) {
+		return fmt.Sprintf("Stripe charged in %s but the order is in %s",
+			session.Currency, order.Currency)
+	}
+
+	// Mode must match the intent the lines describe. A recurring tier settled in
+	// payment mode is a member charged once for a membership that will never
+	// renew; a one-off settled in subscription mode is the reverse.
+	wantMode := "payment"
+	if recurring {
+		wantMode = "subscription"
+	}
+	if session.Mode != wantMode {
+		return fmt.Sprintf("Stripe used %s mode but the order's lines describe %s",
+			session.Mode, wantMode)
+	}
+	return ""
 }
 
 // projectSubscription applies the recurring lifecycle: a renewal advances the

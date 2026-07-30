@@ -171,6 +171,17 @@ Checkout Session and therefore completes synchronously, so
 `invoice.paid` for recurring money. A payment-intent event would carry nothing
 those two do not.
 
+**Settlement compares the money before granting anything.** The canonical
+re-read now checks Stripe's `amount_total`, currency and mode against the order's
+frozen lines; a mismatch settles nothing, grants nothing, and raises a
+`settlement_amount_mismatch` alert naming both numbers. Until that comparison
+existed the re-read was a ceremony — the projector fetched the session and
+settled on `payment_status == paid` alone. It was also untestable, because the
+Stripe fake hardcoded `amount_total` to zero; the fake now totals the line items
+actually submitted, and a fixture that marks a price `verified_at` must register
+it with the fake, because claiming Stripe verified a price it has never seen is a
+state that cannot exist.
+
 This table replaces a claim that was false in a way no test could see. Six types
 were listed as settlement authorities while four of them resolved nothing —
 `invoice.paid` and both subscription events carry no Checkout Session, so the

@@ -82,7 +82,7 @@ func newSettlement(t *testing.T, program string) *settlementFixture {
 	}
 
 	person := seedPerson(t, pool)
-	slug := seedSellable(t, pool, program)
+	slug := seedSellable(t, pool, fake, program)
 	switch program {
 	case "friends-custom":
 		// No slug: the member names the amount, which is the path with no
@@ -408,7 +408,7 @@ func seedPerson(t *testing.T, pool *db.Pool) checkout.Person {
 
 // seedSellable creates what the requested flow needs and returns the slug to
 // buy. "friends-custom" means: no fixed tier, the member names the amount.
-func seedSellable(t *testing.T, pool *db.Pool, program string) string {
+func seedSellable(t *testing.T, pool *db.Pool, fake *stripetest.Server, program string) string {
 	t.Helper()
 	ctx := context.Background()
 	repo := catalogdb.New()
@@ -429,10 +429,12 @@ func seedSellable(t *testing.T, pool *db.Pool, program string) string {
 		t.Fatalf("seed item: %v", err)
 	}
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	priceID := "price_" + suffix
+	const amount = 2500
 	versionID, err := repo.InsertPriceVersion(ctx, pool.Conn(), catalogdb.PriceVersion{
 		CatalogItemID: item.ID, Environment: core.StripeSandbox, Account: account,
-		ProductID: "prod_" + suffix, PriceID: "price_" + suffix,
-		Amount: 2500, Currency: "usd",
+		ProductID: "prod_" + suffix, PriceID: priceID,
+		Amount: amount, Currency: "usd",
 		Recurring: true, Interval: "month", IntervalCount: 1,
 		ActiveFrom: time.Now().UTC(),
 	})
@@ -442,6 +444,11 @@ func seedSellable(t *testing.T, pool *db.Pool, program string) string {
 	if err := repo.MarkVerified(ctx, pool.Conn(), versionID, time.Now().UTC(), nil); err != nil {
 		t.Fatalf("verify version: %v", err)
 	}
+	// MarkVerified claims this price was read back from Stripe, so Stripe must
+	// know it. Without this the fake computes a session total of zero from a
+	// price it has never seen, and the settlement money comparison — correctly —
+	// refuses to settle anything.
+	fake.SeedPrice(priceID, amount, "usd")
 	t.Cleanup(func() {
 		c := context.Background()
 		_, _ = pool.Conn().Exec(c, `
@@ -511,6 +518,20 @@ func (f *settlementFixture) signalsFor(t *testing.T, objectID string) []string {
 		t.Fatalf("iterate signals: %v", err)
 	}
 	return out
+}
+
+// sessionTotal is the order's own frozen total, which is what a correct Stripe
+// session must equal. Reading it from the order rather than restating a literal
+// keeps a currency test from accidentally also being an amount test.
+func (f *settlementFixture) sessionTotal(t *testing.T) int64 {
+	t.Helper()
+	var total int64
+	if err := f.pool.Conn().QueryRow(context.Background(), `
+		SELECT COALESCE(sum(amount * quantity), 0) FROM order_lines WHERE order_id = $1
+	`, f.orderID).Scan(&total); err != nil {
+		t.Fatalf("read order total: %v", err)
+	}
+	return total
 }
 
 // seedFutureObservation records an application an hour ahead, so the next real
