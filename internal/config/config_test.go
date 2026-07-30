@@ -23,26 +23,29 @@ func key(b byte) string {
 func setEnv(t *testing.T, overrides map[string]string) {
 	t.Helper()
 	base := map[string]string{
-		"PORTAL_ENV":                      "production",
-		"PORTAL_BASE_URL":                 "https://members.example.org",
-		"PORTAL_DATABASE_URL":             "postgres://portal@localhost/portal",
-		"PORTAL_ENCRYPTION_KEY_ID":        "pii-v1",
-		"PORTAL_ENCRYPTION_KEY":           key(1),
-		"PORTAL_SESSION_KEY_ID":           "session-v1",
-		"PORTAL_SESSION_KEY":              key(2),
-		"PORTAL_OIDC_ISSUER":              "https://id.example.org",
-		"PORTAL_OIDC_CLIENT_ID":           "portal",
-		"PORTAL_OIDC_CLIENT_SECRET":       "secret",
-		"PORTAL_OIDC_REDIRECT_URL":        "https://members.example.org/auth/callback",
-		"PORTAL_LISTEN_ADDR":              "",
-		"PORTAL_SESSION_IDLE_TTL":         "",
-		"PORTAL_SESSION_ABSOLUTE_TTL":     "",
-		"PORTAL_TRUST_PROXY":              "",
-		"PORTAL_TRUSTED_PROXY_CIDRS":      "",
-		"PORTAL_ENCRYPTION_PREVIOUS_KEYS": "",
-		"PORTAL_SESSION_PREVIOUS_KEYS":    "",
-		"PORTAL_BRAND_NAME":               "",
-		"PORTAL_BRAND_TAGLINE":            "",
+		"PORTAL_ENV":                        "production",
+		"PORTAL_BASE_URL":                   "https://members.example.org",
+		"PORTAL_DATABASE_URL":               "postgres://portal@localhost/portal",
+		"PORTAL_ENCRYPTION_KEY_ID":          "pii-v1",
+		"PORTAL_ENCRYPTION_KEY":             key(1),
+		"PORTAL_SESSION_KEY_ID":             "session-v1",
+		"PORTAL_SESSION_KEY":                key(2),
+		"PORTAL_OIDC_ISSUER":                "https://id.example.org",
+		"PORTAL_OIDC_CLIENT_ID":             "portal",
+		"PORTAL_OIDC_CLIENT_SECRET":         "secret",
+		"PORTAL_OIDC_REDIRECT_URL":          "https://members.example.org/auth/callback",
+		"PORTAL_LISTEN_ADDR":                "",
+		"PORTAL_SESSION_IDLE_TTL":           "",
+		"PORTAL_SESSION_ABSOLUTE_TTL":       "",
+		"PORTAL_TRUST_PROXY":                "",
+		"PORTAL_TRUSTED_PROXY_CIDRS":        "",
+		"PORTAL_ENCRYPTION_PREVIOUS_KEYS":   "",
+		"PORTAL_SESSION_PREVIOUS_KEYS":      "",
+		"PORTAL_STRIPE_SECRET_KEY":          "",
+		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT": "",
+		"PORTAL_STRIPE_DONATIONS_ACCOUNT":   "",
+		"PORTAL_BRAND_NAME":                 "",
+		"PORTAL_BRAND_TAGLINE":              "",
 	}
 	for name, value := range overrides {
 		base[name] = value
@@ -373,4 +376,40 @@ func TestRequireWorkerDoesNotReferenceKeyRings(t *testing.T) {
 		}
 		return true
 	})
+}
+
+// catalog-sync needs the database and the Stripe credential set — and, like
+// the worker, must never be asked for browser or PII secrets.
+func TestRequireCatalogSyncNeedsStripeCredentials(t *testing.T) {
+	setEnv(t, nil)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = cfg.RequireCatalogSync()
+	if err == nil {
+		t.Fatal("catalog-sync accepted a configuration with no Stripe credentials")
+	}
+	for _, want := range []string{
+		"PORTAL_STRIPE_SECRET_KEY",
+		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT",
+		"PORTAL_STRIPE_DONATIONS_ACCOUNT",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name %s:\n%v", want, err)
+		}
+	}
+
+	setEnv(t, map[string]string{
+		"PORTAL_STRIPE_SECRET_KEY":          "sk_test_x",
+		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT": "acct_m",
+		"PORTAL_STRIPE_DONATIONS_ACCOUNT":   "acct_d",
+	})
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.RequireCatalogSync(); err != nil {
+		t.Fatalf("a complete catalog-sync configuration was rejected: %v", err)
+	}
 }

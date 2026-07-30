@@ -74,7 +74,7 @@ func newTestClient(t *testing.T, f *fakeStripe) *Client {
 	t.Helper()
 	c, err := New(Options{
 		APIKey:               "sk_test_abc",
-		Environment:          core.Development,
+		Environment:          core.StripeSandbox,
 		MembershipsAccountID: membershipsAcct,
 		DonationsAccountID:   donationsAcct,
 		BaseURL:              f.server.URL,
@@ -163,7 +163,7 @@ func TestOversizedResponsesAreRefused(t *testing.T) {
 
 	c, err := New(Options{
 		APIKey:               "sk_test_abc",
-		Environment:          core.Development,
+		Environment:          core.StripeSandbox,
 		MembershipsAccountID: membershipsAcct,
 		DonationsAccountID:   donationsAcct,
 		BaseURL:              f.server.URL,
@@ -245,25 +245,25 @@ func TestKeyModeMustMatchEnvironment(t *testing.T) {
 	}
 
 	live := base
-	live.APIKey, live.Environment = "sk_live_abc", core.Development
+	live.APIKey, live.Environment = "sk_live_abc", core.StripeSandbox
 	if _, err := New(live); err == nil {
 		t.Error("a live key was accepted outside production")
 	}
 
 	test := base
-	test.APIKey, test.Environment = "sk_test_abc", core.Production
+	test.APIKey, test.Environment = "sk_test_abc", core.StripeProduction
 	if _, err := New(test); err == nil {
 		t.Error("a test key was accepted in production")
 	}
 
 	junk := base
-	junk.APIKey, junk.Environment = "not-a-key", core.Development
+	junk.APIKey, junk.Environment = "not-a-key", core.StripeSandbox
 	if _, err := New(junk); err == nil {
 		t.Error("a malformed key was accepted")
 	}
 
 	same := base
-	same.APIKey, same.Environment = "sk_test_abc", core.Development
+	same.APIKey, same.Environment = "sk_test_abc", core.StripeSandbox
 	same.DonationsAccountID = membershipsAcct
 	if _, err := New(same); err == nil {
 		t.Error("the same account ID was accepted for both accounts")

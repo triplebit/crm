@@ -40,10 +40,10 @@ const DefaultMaxResponseBytes = 4 << 20
 // are required.
 type Options struct {
 	// APIKey is the organization-level secret key. Its prefix must agree
-	// with Environment: a live key in a sandbox build (or the reverse) is a
+	// with Environment: a live key against the sandbox (or the reverse) is a
 	// construction error, not a runtime surprise.
 	APIKey      string
-	Environment core.Environment
+	Environment core.StripeEnvironment
 
 	// MembershipsAccountID and DonationsAccountID are the acct_ identifiers
 	// of the organization's two Stripe accounts, used as the Stripe-Context
@@ -77,7 +77,7 @@ func New(opts Options) (*Client, error) {
 	case opts.APIKey == "":
 		return nil, errors.New("stripepay: an API key is required")
 	case opts.Environment.IsZero():
-		return nil, errors.New("stripepay: an environment is required")
+		return nil, errors.New("stripepay: a Stripe environment is required")
 	case opts.MembershipsAccountID == "" || opts.DonationsAccountID == "":
 		return nil, errors.New("stripepay: both Stripe account IDs are required")
 	case !strings.HasPrefix(opts.MembershipsAccountID, "acct_"),
@@ -128,18 +128,18 @@ func New(opts Options) (*Client, error) {
 }
 
 // checkKeyEnvironment refuses a key whose mode disagrees with the configured
-// environment. The prefixes are documented Stripe conventions: sk_live_/
+// Stripe universe. The prefixes are documented Stripe conventions: sk_live_/
 // rk_live_ keys move real money.
-func checkKeyEnvironment(key string, env core.Environment) error {
+func checkKeyEnvironment(key string, env core.StripeEnvironment) error {
 	live := strings.HasPrefix(key, "sk_live_") || strings.HasPrefix(key, "rk_live_")
 	test := strings.HasPrefix(key, "sk_test_") || strings.HasPrefix(key, "rk_test_")
 	switch {
 	case !live && !test:
 		return errors.New("stripepay: the API key is neither a live nor a test secret key")
-	case env.IsProduction() && !live:
-		return errors.New("stripepay: production requires a live API key")
-	case !env.IsProduction() && !test:
-		return errors.New("stripepay: a live API key must not be used outside production")
+	case env.IsLive() && !live:
+		return errors.New("stripepay: the live Stripe environment requires a live API key")
+	case !env.IsLive() && !test:
+		return errors.New("stripepay: a live API key must not be used against the sandbox")
 	}
 	return nil
 }

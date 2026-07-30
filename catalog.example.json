@@ -1,0 +1,25 @@
+{
+  "items": [
+    {
+      "slug": "hotspot-basic",
+      "name": "Hotspot Membership — Basic",
+      "kind": "hotspot_tier",
+      "price": {"amount": "15.00", "currency": "usd", "recurring": true, "interval": "month"}
+    },
+    {
+      "slug": "hotspot-device",
+      "name": "Hotspot Device",
+      "kind": "device",
+      "requires_shipping": true,
+      "requires_imei": true,
+      "inventory_tracked": true,
+      "price": {"amount": "80.00", "currency": "usd"}
+    },
+    {
+      "slug": "friends-monthly",
+      "name": "Friends of Triplebit — Monthly",
+      "kind": "friends_tier",
+      "price": {"amount": "10.00", "currency": "usd", "recurring": true, "interval": "month"}
+    }
+  ]
+}

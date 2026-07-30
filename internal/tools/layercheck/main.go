@@ -66,9 +66,14 @@ var layers = map[string]int{
 	"internal/redact":  0, // sensitive text as a type, not a string
 	"migrations":       0, // embedded SQL + checksum ledger + Verify()
 
-	// L10 — the shared value vocabulary and the price allowlist.
-	"internal/core":    10,
-	"internal/catalog": 10, // imports core only; never the Stripe client
+	// L10 — the shared value vocabulary.
+	"internal/core": 10,
+
+	// L12 — the price manifest. Its own comment used to claim "imports core
+	// only" while sitting at core's layer, which R1 itself refuses: equal
+	// layers cannot import each other. The claim was the intent; the number
+	// now permits it. Never the Stripe client — R5 enforces that part.
+	"internal/catalog": 12,
 
 	// L15 — the only Set-Cookie writer. Not a leaf, because refusing to serve
 	// non-Secure cookies in production requires knowing the environment, and

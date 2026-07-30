@@ -58,7 +58,8 @@ type Config struct {
 	SessionIdleTTL     time.Duration
 	SessionAbsoluteTTL time.Duration
 
-	OIDC OIDC
+	OIDC   OIDC
+	Stripe Stripe
 
 	// TrustProxy enables X-Forwarded-For parsing, and is meaningless without at
 	// least one CIDR — which is enforced, not assumed.
@@ -98,6 +99,16 @@ type OIDC struct {
 	RedirectURL  string
 }
 
+// Stripe is the organization credential and the two account identifiers.
+// Which Stripe universe they address is not configured separately: it is
+// derived from the environment (core.StripeEnvironmentFor), and stripepay
+// refuses a key whose mode disagrees.
+type Stripe struct {
+	SecretKey            string
+	MembershipsAccountID string
+	DonationsAccountID   string
+}
+
 const (
 	defaultListenAddr   = ":8080"
 	defaultIdleTTL      = 30 * time.Minute
@@ -134,6 +145,12 @@ func Load() (*Config, error) {
 		// "Pocket ID is broken" to the operator who pasted it.
 		ClientSecret: strings.TrimSpace(os.Getenv("PORTAL_OIDC_CLIENT_SECRET")),
 		RedirectURL:  strings.TrimSpace(os.Getenv("PORTAL_OIDC_REDIRECT_URL")),
+	}
+
+	cfg.Stripe = Stripe{
+		SecretKey:            strings.TrimSpace(os.Getenv("PORTAL_STRIPE_SECRET_KEY")),
+		MembershipsAccountID: strings.TrimSpace(os.Getenv("PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT")),
+		DonationsAccountID:   strings.TrimSpace(os.Getenv("PORTAL_STRIPE_DONATIONS_ACCOUNT")),
 	}
 
 	cfg.TrustProxy = l.bool("PORTAL_TRUST_PROXY", false)
@@ -191,6 +208,18 @@ func (c *Config) RequireWorker() error {
 func (c *Config) RequireMigrate() error {
 	l := &loader{}
 	l.require(c.DatabaseURL != "", "PORTAL_DATABASE_URL is required")
+	return l.err()
+}
+
+// RequireCatalogSync validates what the catalog-sync command needs: the
+// database, and the Stripe credential set. Like the worker, it never touches
+// the session or PII key rings.
+func (c *Config) RequireCatalogSync() error {
+	l := &loader{}
+	l.require(c.DatabaseURL != "", "PORTAL_DATABASE_URL is required")
+	l.require(c.Stripe.SecretKey != "", "PORTAL_STRIPE_SECRET_KEY is required")
+	l.require(c.Stripe.MembershipsAccountID != "", "PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT is required")
+	l.require(c.Stripe.DonationsAccountID != "", "PORTAL_STRIPE_DONATIONS_ACCOUNT is required")
 	return l.err()
 }
 

@@ -44,7 +44,9 @@ func main() {
 		err = runServe(context.Background(), args)
 	case "healthcheck":
 		err = runHealthcheck(context.Background(), args)
-	case "worker", "catalog-sync", "bootstrap-staff",
+	case "catalog-sync":
+		err = runCatalogSync(context.Background(), args)
+	case "worker", "bootstrap-staff",
 		"rotate-pii", "doctor":
 		// Implemented in later milestones. Listed explicitly so an unimplemented
 		// subcommand reports that clearly, and a misspelling still exits 2.
