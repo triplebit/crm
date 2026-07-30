@@ -538,3 +538,143 @@ func TestMigration000003PreflightRefusesToDestroyCiphertext(t *testing.T) {
 		t.Errorf("error %q does not explain the precondition", err)
 	}
 }
+
+// Migration 000004's membership anchor. A membership is priced by exactly one
+// of two things: a catalog price version, or — only for a custom-amount
+// Friends subscription, where the member set the price — the immutable order
+// line it was sold under. Every other combination must be impossible.
+func TestMembershipMustHaveExactlyOnePriceAnchor(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	userID := seedUser(t, ctx, pool)
+	itemID := seedCatalogItem(t, ctx, pool)
+	t.Cleanup(func() { testdb.PurgeOrders(t, pool, userID) })
+
+	// A verified version to anchor the catalog-priced cases.
+	versionID := uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO catalog_price_versions (id, catalog_item_id, environment, account_ref,
+		    stripe_product_id, stripe_price_id, amount, currency, recurring,
+		    billing_interval, interval_count, active_from)
+		VALUES ($1, $2, 'sandbox', 'donations', 'prod_anchor', 'price_anchor',
+		        2500, 'usd', true, 'month', 1, now())
+	`, versionID, itemID); err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Conn().Exec(context.Background(),
+			`DELETE FROM catalog_price_versions WHERE id = $1`, versionID)
+	})
+
+	// An order line to anchor the custom case.
+	orderID, lineID := uuid.New(), uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO orders (id, user_id, program, environment, account_ref, state,
+		                    currency, idempotency_key)
+		VALUES ($1, $2, 'friends', 'sandbox', 'donations', 'paid', 'usd', $3)
+	`, orderID, userID, orderID.String()); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO order_lines (id, order_id, line_number, kind, slug, name,
+		                         amount, currency, quantity, account_ref)
+		VALUES ($1, $2, 1, 'friends_tier', 'friends-custom', 'Custom',
+		        1250, 'usd', 1, 'donations')
+	`, lineID, orderID); err != nil {
+		t.Fatalf("seed line: %v", err)
+	}
+
+	insert := func(program string, version, line *uuid.UUID) error {
+		id := uuid.New()
+		account := "donations"
+		if program == "hotspot" {
+			account = "memberships"
+		}
+		_, err := pool.Conn().Exec(ctx, `
+			INSERT INTO memberships (id, user_id, program, environment, account_ref,
+			    tier_price_version_id, source_order_line_id, stripe_customer_id,
+			    stripe_subscription_id, status)
+			VALUES ($1, $2, $3, 'sandbox', $4, $5, $6, 'cus_x', $7, 'active')
+		`, id, userID, program, account, version, line, id.String())
+		if err == nil {
+			// Memberships are not append-only, so a success can be cleaned up.
+			_, _ = pool.Conn().Exec(ctx, `DELETE FROM memberships WHERE id = $1`, id)
+		}
+		return err
+	}
+
+	if err := insert("friends", &versionID, nil); err != nil {
+		t.Errorf("a catalog-priced Friends membership was refused: %v", err)
+	}
+	if err := insert("friends", nil, &lineID); err != nil {
+		t.Errorf("a custom-amount Friends membership anchored to its order line was refused: %v", err)
+	}
+	if err := insert("friends", nil, nil); err == nil {
+		t.Error("a membership with no price anchor at all was accepted")
+	}
+	if err := insert("friends", &versionID, &lineID); err == nil {
+		t.Error("a membership with both anchors was accepted; exactly one must apply")
+	}
+	// Hotspot has no custom-amount path, so it may never anchor on a line.
+	if err := insert("hotspot", nil, &lineID); err == nil {
+		t.Error("a hotspot membership anchored to an order line was accepted")
+	}
+}
+
+// Migration 000004's lease shape. A claim must carry both a token and a
+// deadline or neither, so a 'processing' row is always recoverable.
+func TestWebhookLeaseIsAllOrNothing(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	insert := func(state string, token *uuid.UUID, until *string) error {
+		id := uuid.New()
+		_, err := pool.Conn().Exec(ctx, `
+			INSERT INTO webhook_events (id, environment, account_ref, stripe_event_id,
+			    event_type, payload, processing_state, lease_token, leased_until)
+			VALUES ($1, 'sandbox', 'memberships', $2, 'test.event', '{}'::jsonb,
+			        $3, $4, $5::timestamptz)
+		`, id, "evt_"+strings.ReplaceAll(id.String(), "-", ""), state, token, until)
+		if err == nil {
+			_, _ = pool.Conn().Exec(ctx, `DELETE FROM webhook_events WHERE id = $1`, id)
+		}
+		return err
+	}
+
+	token := uuid.New()
+	future := "2030-01-01T00:00:00Z"
+
+	if err := insert("pending", nil, nil); err != nil {
+		t.Errorf("an unclaimed pending event was refused: %v", err)
+	}
+	if err := insert("processing", &token, &future); err != nil {
+		t.Errorf("a properly claimed event was refused: %v", err)
+	}
+	if err := insert("processing", nil, nil); err == nil {
+		t.Error("a 'processing' event with no lease was accepted; it would be unrecoverable")
+	}
+	if err := insert("processing", &token, nil); err == nil {
+		t.Error("a claim with no deadline was accepted; it would never expire")
+	}
+	if err := insert("pending", &token, &future); err == nil {
+		t.Error("a pending event holding a lease was accepted")
+	}
+}
+
+// Migration 000004's non-empty guards. An empty idempotency key is not a key.
+func TestIdempotencyKeysMayNotBeEmpty(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	userID := seedUser(t, ctx, pool)
+	t.Cleanup(func() { testdb.PurgeOrders(t, pool, userID) })
+
+	_, err := pool.Conn().Exec(ctx, `
+		INSERT INTO orders (id, user_id, program, environment, account_ref, state,
+		                    currency, idempotency_key)
+		VALUES ($1, $2, 'hotspot', 'sandbox', 'memberships', 'draft', 'usd', '')
+	`, uuid.New(), userID)
+	if err == nil {
+		t.Error("an order with an empty idempotency key was accepted")
+	}
+}
