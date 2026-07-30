@@ -57,14 +57,15 @@ const modulePath = "triplebit.org/portal"
 var layers = map[string]int{
 	// L0 — leaves. Zero internal imports. Each is small, single-purpose and
 	// independently testable.
-	"internal/safeerr": 0, // human-facing vs internal error text
-	"internal/cryptox": 0, // AES-256-GCM keyring + record/field-bound PII AAD
-	"internal/httpx":   0, // middleware, security headers, XFF, rate limiting
-	"internal/csrf":    0, // HMAC token, constant-time compare
-	"internal/tokens":  0, // opaque 32-byte token + SHA-256 digest
-	"internal/money":   0, // exact cents parsing; no float ever
-	"internal/redact":  0, // sensitive text as a type, not a string
-	"migrations":       0, // embedded SQL + checksum ledger + Verify()
+	"internal/safeerr":    0, // human-facing vs internal error text
+	"internal/cryptox":    0, // AES-256-GCM keyring + record/field-bound PII AAD
+	"internal/httpx":      0, // middleware, security headers, XFF, rate limiting
+	"internal/csrf":       0, // HMAC token, constant-time compare
+	"internal/tokens":     0, // opaque 32-byte token + SHA-256 digest
+	"internal/money":      0, // exact cents parsing; no float ever
+	"internal/redact":     0, // sensitive text as a type, not a string
+	"internal/stripetest": 0, // the shared fake Stripe server; test imports only
+	"migrations":          0, // embedded SQL + checksum ledger + Verify()
 
 	// L10 — the shared value vocabulary.
 	"internal/core": 10,

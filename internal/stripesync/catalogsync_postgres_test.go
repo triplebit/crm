@@ -2,10 +2,7 @@ package stripesync
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -17,177 +14,11 @@ import (
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/repo/catalogdb"
 	"triplebit.org/portal/internal/stripepay"
+	"triplebit.org/portal/internal/stripetest"
 	"triplebit.org/portal/internal/testdb"
 )
 
-// fakeStripe is stateful where it matters for sync: it honours idempotency
-// keys (same key → same object, which is the crash-recovery contract the
-// syncer builds on), remembers created objects so retrieval works, and can
-// fail a chosen call once to simulate a crash mid-sequence.
-type fakeStripe struct {
-	mu       sync.Mutex
-	server   *httptest.Server
-	byIdem   map[string]map[string]any
-	prices   map[string]map[string]any
-	products map[string]map[string]any
-	seq      int
-
-	creates     int // POSTs that created something new (not idempotent replays)
-	priceGets   int
-	productGets int
-
-	// failDeactivations makes that many price-deactivation calls fail with a
-	// 500 before behaving again, for crash-injection tests.
-	failDeactivations int
-}
-
-func newFakeStripe(t *testing.T) *fakeStripe {
-	t.Helper()
-	f := &fakeStripe{
-		byIdem:   map[string]map[string]any{},
-		prices:   map[string]map[string]any{},
-		products: map[string]map[string]any{},
-	}
-	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
-	t.Cleanup(f.server.Close)
-	return f
-}
-
-func (f *fakeStripe) handle(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	w.Header().Set("Content-Type", "application/json")
-	_ = r.ParseForm()
-
-	respond := func(obj map[string]any) { _ = json.NewEncoder(w).Encode(obj) }
-
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/products":
-		idem := r.Header.Get("Idempotency-Key")
-		if prior, ok := f.byIdem[idem]; ok {
-			respond(prior)
-			return
-		}
-		f.seq++
-		obj := map[string]any{
-			"id": fmt.Sprintf("prod_%d", f.seq), "object": "product",
-			"name": r.PostForm.Get("name"), "active": true,
-			"metadata": map[string]any{"portal_slug": r.PostForm.Get("metadata[portal_slug]")},
-		}
-		f.products[obj["id"].(string)] = obj
-		f.byIdem[idem] = obj
-		f.creates++
-		respond(obj)
-
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/products/"):
-		f.productGets++
-		id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
-		if obj, ok := f.products[id]; ok {
-			respond(obj)
-			return
-		}
-		http.Error(w, `{"error":{"message":"no such product"}}`, http.StatusNotFound)
-
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/products/"):
-		id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
-		obj, ok := f.products[id]
-		if !ok {
-			http.Error(w, `{"error":{"message":"no such product"}}`, http.StatusNotFound)
-			return
-		}
-		if name := r.PostForm.Get("name"); name != "" {
-			obj["name"] = name
-		}
-		respond(obj)
-
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/prices":
-		idem := r.Header.Get("Idempotency-Key")
-		if prior, ok := f.byIdem[idem]; ok {
-			respond(prior)
-			return
-		}
-		f.seq++
-		obj := map[string]any{
-			"id": fmt.Sprintf("price_%d", f.seq), "object": "price",
-			"product":  r.PostForm.Get("product"),
-			"currency": r.PostForm.Get("currency"),
-			"active":   true,
-		}
-		var amount int64
-		_, _ = fmt.Sscan(r.PostForm.Get("unit_amount"), &amount)
-		obj["unit_amount"] = amount
-		if interval := r.PostForm.Get("recurring[interval]"); interval != "" {
-			var count int64 = 1
-			_, _ = fmt.Sscan(r.PostForm.Get("recurring[interval_count]"), &count)
-			obj["recurring"] = map[string]any{"interval": interval, "interval_count": count}
-		}
-		f.prices[obj["id"].(string)] = obj
-		f.byIdem[idem] = obj
-		f.creates++
-		respond(obj)
-
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/prices/"):
-		id := strings.TrimPrefix(r.URL.Path, "/v1/prices/")
-		obj, ok := f.prices[id]
-		if !ok {
-			http.Error(w, `{"error":{"message":"no such price"}}`, http.StatusNotFound)
-			return
-		}
-		if r.PostForm.Get("active") == "false" {
-			if f.failDeactivations > 0 {
-				f.failDeactivations--
-				http.Error(w, `{"error":{"message":"injected failure"}}`, http.StatusInternalServerError)
-				return
-			}
-			obj["active"] = false
-		}
-		respond(obj)
-
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/prices/"):
-		f.priceGets++
-		id := strings.TrimPrefix(r.URL.Path, "/v1/prices/")
-		if obj, ok := f.prices[id]; ok {
-			respond(obj)
-			return
-		}
-		http.Error(w, `{"error":{"message":"no such price"}}`, http.StatusNotFound)
-
-	default:
-		http.Error(w, `{"error":{"message":"unexpected `+r.Method+` `+r.URL.Path+`"}}`, http.StatusBadRequest)
-	}
-}
-
-func (f *fakeStripe) priceActive(id string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	obj, ok := f.prices[id]
-	return ok && obj["active"] == true
-}
-
-func (f *fakeStripe) productName(id string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if obj, ok := f.products[id]; ok {
-		return obj["name"].(string)
-	}
-	return ""
-}
-
-// activePriceCount reports how many of the fake's prices are still active —
-// the orphan detector for the concurrency test.
-func (f *fakeStripe) activePriceCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	n := 0
-	for _, p := range f.prices {
-		if p["active"] == true {
-			n++
-		}
-	}
-	return n
-}
-
-func newSyncer(t *testing.T, f *fakeStripe) (*Syncer, *db.Pool) {
+func newSyncer(t *testing.T, f *stripetest.Server) (*Syncer, *db.Pool) {
 	t.Helper()
 	pool := testdb.Pool(t)
 
@@ -205,7 +36,7 @@ func newSyncer(t *testing.T, f *fakeStripe) (*Syncer, *db.Pool) {
 		Environment:          core.StripeSandbox,
 		MembershipsAccountID: "acct_m1",
 		DonationsAccountID:   "acct_d1",
-		BaseURL:              f.server.URL,
+		BaseURL:              f.URL(),
 	})
 	if err != nil {
 		t.Fatalf("stripepay.New: %v", err)
@@ -272,7 +103,7 @@ func openVersion(t *testing.T, pool *db.Pool, slug string) (priceID, productID, 
 
 func TestFreshSyncCreatesAndVerifiesByReadingBack(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -292,15 +123,16 @@ func TestFreshSyncCreatesAndVerifiesByReadingBack(t *testing.T) {
 	if !verified {
 		t.Error("the fresh version was not verified")
 	}
-	if !f.priceActive(priceID) {
+	if !f.PriceActive(priceID) {
 		t.Error("the recorded price is not active in Stripe")
 	}
 	// verified_at must have been EARNED: the create path performs an
 	// independent price retrieve and a product retrieve. A create response
 	// alone must never set it.
-	if f.priceGets < 1 || f.productGets < 1 {
+	priceGets, productGets, _ := f.Gets()
+	if priceGets < 1 || productGets < 1 {
 		t.Errorf("verification read back %d prices and %d products; both must be at least 1",
-			f.priceGets, f.productGets)
+			priceGets, productGets)
 	}
 }
 
@@ -308,7 +140,7 @@ func TestFreshSyncCreatesAndVerifiesByReadingBack(t *testing.T) {
 // mutating Stripe endpoint — that is what makes sync safe to run from cron.
 func TestResyncOfUnchangedManifestIsANoOp(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -317,7 +149,7 @@ func TestResyncOfUnchangedManifestIsANoOp(t *testing.T) {
 	if _, err := s.Sync(ctx, m); err != nil {
 		t.Fatalf("first Sync: %v", err)
 	}
-	createsAfterFirst := f.creates
+	createsAfterFirst := f.Creates()
 
 	result, err := s.Sync(ctx, m)
 	if err != nil {
@@ -326,14 +158,14 @@ func TestResyncOfUnchangedManifestIsANoOp(t *testing.T) {
 	if result.Unchanged != 1 || result.Created != 0 || result.Rotated != 0 || result.Retired != 0 {
 		t.Errorf("second sync result = %s, want 1 unchanged", result)
 	}
-	if f.creates != createsAfterFirst {
-		t.Errorf("second sync created %d new Stripe objects; an unchanged manifest must create none", f.creates-createsAfterFirst)
+	if f.Creates() != createsAfterFirst {
+		t.Errorf("second sync created %d new Stripe objects; an unchanged manifest must create none", f.Creates()-createsAfterFirst)
 	}
 }
 
 func TestPriceChangeRotatesTheVersion(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -368,7 +200,7 @@ func TestPriceChangeRotatesTheVersion(t *testing.T) {
 	if newAmount != 2000 || !verified {
 		t.Errorf("open version amount = %d verified = %t, want 2000 and true", newAmount, verified)
 	}
-	if f.priceActive(oldPriceID) {
+	if f.PriceActive(oldPriceID) {
 		t.Error("the replaced price is still active in Stripe")
 	}
 }
@@ -377,7 +209,7 @@ func TestPriceChangeRotatesTheVersion(t *testing.T) {
 // sellable — locally and in Stripe — and the item records that it used to be.
 func TestRemovedItemIsRetired(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	removed, kept := slugFor(t), slugFor(t)
 	cleanupItem(t, pool, removed)
@@ -415,7 +247,7 @@ func TestRemovedItemIsRetired(t *testing.T) {
 	if openCount != 0 {
 		t.Errorf("%d open versions survived retirement", openCount)
 	}
-	if f.priceActive(removedPriceID) {
+	if f.PriceActive(removedPriceID) {
 		t.Error("the removed item's price is still active in Stripe")
 	}
 
@@ -438,7 +270,7 @@ func TestRemovedItemIsRetired(t *testing.T) {
 // routes it to.
 func TestKindChangeMovesTheItemBetweenAccounts(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -462,7 +294,7 @@ func TestKindChangeMovesTheItemBetweenAccounts(t *testing.T) {
 	if newAccount != "donations" || !verified {
 		t.Errorf("open version account = %q verified = %t, want donations and true", newAccount, verified)
 	}
-	if f.priceActive(oldPriceID) {
+	if f.PriceActive(oldPriceID) {
 		t.Error("the old account's price is still active in Stripe")
 	}
 }
@@ -470,7 +302,7 @@ func TestKindChangeMovesTheItemBetweenAccounts(t *testing.T) {
 // S-1: a rename converges on the next sync, without a price rotation.
 func TestProductRenameConverges(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -487,7 +319,7 @@ func TestProductRenameConverges(t *testing.T) {
 	if result.Renamed != 1 || result.Rotated != 0 {
 		t.Errorf("result = %s, want 1 renamed and 0 rotated", result)
 	}
-	if got := f.productName(productID); got != "New Name" {
+	if got := f.ProductName(productID); got != "New Name" {
 		t.Errorf("Stripe product name = %q, want %q", got, "New Name")
 	}
 }
@@ -496,7 +328,7 @@ func TestProductRenameConverges(t *testing.T) {
 // converge on the next run without minting a second successor.
 func TestFailedRotationConvergesOnRerun(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -508,11 +340,11 @@ func TestFailedRotationConvergesOnRerun(t *testing.T) {
 
 	// The successor is created, then the old price's deactivation fails:
 	// the sync dies after the remote create, before anything was recorded.
-	f.failDeactivations = 1
+	f.FailNextDeactivations(1)
 	if _, err := s.Sync(ctx, changed); err == nil {
 		t.Fatal("the injected deactivation failure did not surface")
 	}
-	pricesAfterCrash := f.creates
+	pricesAfterCrash := f.Creates()
 
 	result, err := s.Sync(ctx, changed)
 	if err != nil {
@@ -521,9 +353,9 @@ func TestFailedRotationConvergesOnRerun(t *testing.T) {
 	if result.Rotated != 1 {
 		t.Errorf("re-run result = %s, want 1 rotated", result)
 	}
-	if f.creates != pricesAfterCrash {
+	if f.Creates() != pricesAfterCrash {
 		t.Errorf("the re-run created %d new Stripe objects; the idempotency key must replay the crashed successor",
-			f.creates-pricesAfterCrash)
+			f.Creates()-pricesAfterCrash)
 	}
 	_, _, _, amount, verified := openVersion(t, pool, slug)
 	if amount != 2000 || !verified {
@@ -536,7 +368,7 @@ func TestFailedRotationConvergesOnRerun(t *testing.T) {
 // in Stripe, the other superseded — never an orphan active price.
 func TestConcurrentSyncsCannotOrphanAPrice(t *testing.T) {
 	ctx := context.Background()
-	f := newFakeStripe(t)
+	f := stripetest.New(t)
 	s, pool := newSyncer(t, f)
 	slug := slugFor(t)
 	cleanupItem(t, pool, slug)
@@ -563,10 +395,10 @@ func TestConcurrentSyncsCannotOrphanAPrice(t *testing.T) {
 	if amount != 2000 && amount != 3000 {
 		t.Errorf("final amount = %d, want one of the two competing manifests", amount)
 	}
-	if !f.priceActive(priceID) {
+	if !f.PriceActive(priceID) {
 		t.Error("the surviving version's price is not active in Stripe")
 	}
-	if got := f.activePriceCount(); got != 1 {
+	if got := f.ActivePriceCount(); got != 1 {
 		t.Errorf("%d active prices in Stripe, want exactly 1: an extra one is an orphan no local row references", got)
 	}
 }

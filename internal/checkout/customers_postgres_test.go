@@ -1,0 +1,210 @@
+package checkout_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"triplebit.org/portal/internal/checkout"
+	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/db"
+	"triplebit.org/portal/internal/repo/customers"
+	"triplebit.org/portal/internal/stripepay"
+	"triplebit.org/portal/internal/stripetest"
+	"triplebit.org/portal/internal/testdb"
+)
+
+func newService(t *testing.T, fake *stripetest.Server) (*checkout.Service, *db.Pool) {
+	t.Helper()
+	pool := testdb.Pool(t)
+	pay, err := stripepay.New(stripepay.Options{
+		APIKey:               "sk_test_checkout",
+		Environment:          core.StripeSandbox,
+		MembershipsAccountID: "acct_m1",
+		DonationsAccountID:   "acct_d1",
+		BaseURL:              fake.URL(),
+	})
+	if err != nil {
+		t.Fatalf("stripepay.New: %v", err)
+	}
+	svc, err := checkout.New(checkout.Options{
+		Customers:   customers.New(),
+		Pool:        pool,
+		Pay:         pay,
+		Environment: core.StripeSandbox,
+		// Tests never really sleep; the fake's propagation is counted in
+		// reads, not time.
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("checkout.New: %v", err)
+	}
+	return svc, pool
+}
+
+func seedPerson(t *testing.T, pool *db.Pool) checkout.Person {
+	t.Helper()
+	ctx := context.Background()
+	id := uuid.New()
+	sub := "checkout-sub-" + id.String()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO users (id, pocket_id_sub, email, display_name, email_verified)
+		VALUES ($1, $2, $3, 'Checkout Member', true)
+	`, id, sub, sub+"@example.test"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = pool.Conn().Exec(c, `DELETE FROM stripe_customers WHERE user_id = $1`, id)
+		_, _ = pool.Conn().Exec(c, `DELETE FROM stripe_customer_creation_intents WHERE user_id = $1`, id)
+		_, _ = pool.Conn().Exec(c, `DELETE FROM users WHERE id = $1`, id)
+	})
+	return checkout.Person{UserID: id, Email: sub + "@example.test", Name: "Checkout Member"}
+}
+
+func TestEnsureCustomerCreatesOncePerPerson(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, _ := newService(t, fake)
+	person := seedPerson(t, mustPool(t))
+
+	first, err := svc.EnsureCustomer(ctx, core.Memberships, person)
+	if err != nil {
+		t.Fatalf("EnsureCustomer: %v", err)
+	}
+	if fake.Creates() != 1 {
+		t.Errorf("%d remote creates, want 1", fake.Creates())
+	}
+
+	// The second call is the fast path: no remote traffic at all.
+	_, productGets, customerGetsBefore := fake.Gets()
+	_ = productGets
+	again, err := svc.EnsureCustomer(ctx, core.Memberships, person)
+	if err != nil {
+		t.Fatalf("second EnsureCustomer: %v", err)
+	}
+	if again != first {
+		t.Errorf("second call returned %s, want %s", again, first)
+	}
+	if fake.Creates() != 1 {
+		t.Error("the second call created another customer")
+	}
+	if _, _, customerGets := fake.Gets(); customerGets != customerGetsBefore {
+		t.Error("the fast path made remote reads")
+	}
+}
+
+// The sharing design: the same cus_ identifier serves both accounts, and the
+// sibling account sees it only after a propagation lag, which EnsureCustomer
+// absorbs with a bounded wait.
+func TestEnsureCustomerSharesAcrossAccountsThroughPropagationLag(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	fake.SetPropagationLag(3)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+
+	inMemberships, err := svc.EnsureCustomer(ctx, core.Memberships, person)
+	if err != nil {
+		t.Fatalf("EnsureCustomer(memberships): %v", err)
+	}
+	inDonations, err := svc.EnsureCustomer(ctx, core.Donations, person)
+	if err != nil {
+		t.Fatalf("EnsureCustomer(donations): %v", err)
+	}
+	if inMemberships != inDonations {
+		t.Fatalf("accounts got different customers: %s vs %s — sharing means one identifier", inMemberships, inDonations)
+	}
+	if fake.Creates() != 1 {
+		t.Errorf("%d remote creates, want 1: the sibling account shares, never mints", fake.Creates())
+	}
+
+	// Both contexts are now recorded locally, so both fast-path.
+	var rows int
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT count(*) FROM stripe_customers WHERE user_id = $1`, person.UserID).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("%d stripe_customers rows, want 2 (one per account context)", rows)
+	}
+}
+
+// The crash window: the intent recorded Stripe's answer, but the process died
+// before the observation row was written. The next call must resume from the
+// intent — no second Customer, no remote create at all when the account is
+// the origin.
+func TestEnsureCustomerResumesFromARecordedIntent(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+	repo := customers.New()
+
+	intent, err := repo.EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeSandbox, core.Memberships, person.Email, person.Name)
+	if err != nil {
+		t.Fatalf("EnsureIntent: %v", err)
+	}
+	if err := repo.RecordIntentResult(ctx, pool.Conn(), intent.ID, "cus_fromthecrash", time.Now().UTC()); err != nil {
+		t.Fatalf("RecordIntentResult: %v", err)
+	}
+
+	got, err := svc.EnsureCustomer(ctx, core.Memberships, person)
+	if err != nil {
+		t.Fatalf("EnsureCustomer: %v", err)
+	}
+	if got != "cus_fromthecrash" {
+		t.Errorf("EnsureCustomer returned %s, want the intent's recorded customer", got)
+	}
+	if fake.Creates() != 0 {
+		t.Errorf("%d remote creates, want 0: the intent already holds the answer", fake.Creates())
+	}
+}
+
+// Racing requests — including ones targeting different accounts — converge on
+// one Customer, because the intent's unique index makes the first insert the
+// only insert, and everyone else inherits its idempotency key.
+func TestConcurrentEnsureCustomerMintsExactlyOne(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	fake.SetPropagationLag(1)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+
+	accounts := []core.AccountRef{core.Memberships, core.Donations, core.Memberships, core.Donations}
+	ids := make([]string, len(accounts))
+	errs := make([]error, len(accounts))
+	var wg sync.WaitGroup
+	for i, account := range accounts {
+		wg.Add(1)
+		go func(i int, account core.AccountRef) {
+			defer wg.Done()
+			ids[i], errs[i] = svc.EnsureCustomer(ctx, account, person)
+		}(i, account)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent call %d: %v", i, err)
+		}
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[0] {
+			t.Fatalf("call %d got %s, call 0 got %s: one person, one customer", i, ids[i], ids[0])
+		}
+	}
+	if fake.Creates() != 1 {
+		t.Errorf("%d remote creates, want exactly 1", fake.Creates())
+	}
+}
+
+// mustPool exists because seedPerson needs the pool before newService has
+// been called in some tests.
+func mustPool(t *testing.T) *db.Pool {
+	t.Helper()
+	return testdb.Pool(t)
+}
