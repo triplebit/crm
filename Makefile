@@ -99,6 +99,35 @@ mod-verify:
 vuln:
 	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
+# The placeholder environment every compose gate runs with, defined once.
+#
+# It used to be written out four times, and the fourth copy went stale the
+# moment a variable was added: CI failed because docker-check kept its own list
+# and did not know about the webhook secrets. A gate's env list is not
+# interesting enough to maintain in parallel.
+COMPOSE_CHECK_ENV = \
+	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
+	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+	PORTAL_STRIPE_SECRET_KEY=check \
+	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
+	PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
+	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck
+
+# The same list with PORTAL_SESSION_KEY absent, for the negative case below.
+COMPOSE_CHECK_ENV_NO_SESSION_KEY = \
+	PORTAL_SESSION_KEY_ID=check \
+	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+	PORTAL_STRIPE_SECRET_KEY=check \
+	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
+	PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
+	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck
+
 # Validates compose.yaml without starting anything. The dummy values satisfy
 # the ":?" required-variable checks, whose job is refusing a real start-up
 # without real keys — syntax validation is not a start-up.
@@ -109,28 +138,12 @@ vuln:
 # negative case below silently passed for the wrong reason, which is how it
 # was noticed.
 compose-check:
-	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
-	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
-	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
-	PORTAL_STRIPE_SECRET_KEY=check \
-	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
-	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
-	PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
-	PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
-	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
+	$(COMPOSE_CHECK_ENV) \
 	docker compose --env-file /dev/null config -q
 	@# And prove the required-variable guards are guards: with one unset,
 	@# compose must refuse. Otherwise a weakened ":?" that silently defaulted
 	@# would produce identical valid output to a correct one.
-	@if PORTAL_SESSION_KEY_ID=check \
-		PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
-		PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
-		PORTAL_STRIPE_SECRET_KEY=check \
-		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
-		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
-		PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
-		PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
-		POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
+	@if $(COMPOSE_CHECK_ENV_NO_SESSION_KEY) \
 		docker compose --env-file /dev/null config -q 2>/dev/null; then \
 		echo "compose accepted a missing PORTAL_SESSION_KEY; the required-variable guard is not a guard"; \
 		exit 1; \
@@ -141,15 +154,7 @@ compose-check:
 	@# compromised container's environment is exposed whether the process reads
 	@# it or not. The worker block was written by copying the portal block,
 	@# which is exactly how a key gets carried along by accident.
-	@if PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
-		PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
-		PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
-		PORTAL_STRIPE_SECRET_KEY=check \
-		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
-		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
-		PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
-		PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
-		POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
+	@if $(COMPOSE_CHECK_ENV) \
 		docker compose --env-file /dev/null config \
 		| awk '/^  worker:/{inside=1; next} /^  [a-z]/{inside=0} inside' \
 		| grep -E 'PORTAL_(SESSION_KEY|ENCRYPTION_KEY|OIDC)'; then \
@@ -174,13 +179,7 @@ docker-build:
 # surface at deploy time.
 docker-check:
 	PORTAL_REVISION=ci-check \
-	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
-	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
-	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
-	PORTAL_STRIPE_SECRET_KEY=check \
-	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
-	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
-	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
+	$(COMPOSE_CHECK_ENV) \
 	docker compose --env-file /dev/null build --quiet
 
 # Reports what has moved on upstream. Deliberately a report and not a gate:
