@@ -252,15 +252,18 @@ The reasoning behind each lives in `docs/DECISIONS.md`; this table is the index.
 - **Two Stripe accounts mean two Billing Portals.** `bpc_` configurations are
   account-specific, so there is no single "manage my billing" page once Friends
   ships.
-- **Cross-account Customer Sharing: the spike ran, and it does not propagate
-  yet.** 2026-07-30, real sandbox: a Customer created in the memberships
-  account stayed `resource_missing` in the donations account for a full
-  60 seconds. Most likely the Organization has no customer sharing group
-  configured (a Dashboard setting, not reachable by API key). BLOCKS the M5
-  shared-card design: either the owner enables sharing and the spike is
-  re-run to measure the real propagation window, or M5 falls back to
-  per-account Customers with no shared saved cards. Decide before M5's
-  EnsureCustomer is written.
+- **Cross-account Customer Sharing: proven, with numbers.** The first spike
+  (2026-07-30) found no propagation at all — the Organization had no sharing
+  group; a Dashboard setting, invisible to the API, that would otherwise have
+  been discovered mid-M5. The owner enabled customer and payment-method
+  sharing; the re-run measured: Customers visible in the sibling account with
+  the **same `cus_` ID in ~1.1s** (3 trials, both directions, attributes
+  intact); a card attached in one account listable from the other with the
+  **same `pm_` ID in ~7.6s**. M5's `EnsureCustomer` therefore looks the
+  Customer up in either account and treats `resource_missing` as propagation
+  lag with a bounded retry (spec: tolerate 60s; observed: seconds). The M5
+  sandbox test asserts this end to end. Two Billing Portals (`bpc_` configs
+  are account-specific) remains true and unresolved.
 - **Card-only must stay enforced in code**, not as a Dashboard setting. Enabling
   ACH in the Stripe Dashboard would make four deferred event types load-bearing.
 
