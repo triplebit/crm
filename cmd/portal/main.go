@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -37,7 +38,9 @@ func main() {
 		err = runVersion(args)
 	case "help", "-h", "--help":
 		usage(os.Stdout)
-	case "serve", "worker", "migrate", "catalog-sync", "bootstrap-staff",
+	case "migrate":
+		err = runMigrate(context.Background(), args)
+	case "serve", "worker", "catalog-sync", "bootstrap-staff",
 		"rotate-pii", "doctor", "healthcheck":
 		// Implemented in later milestones. Listed explicitly so an unimplemented
 		// subcommand reports that clearly, and a misspelling still exits 2.

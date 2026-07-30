@@ -1,8 +1,16 @@
 GO ?= go
 
+# Tests that need PostgreSQL read PORTAL_TEST_DATABASE_URL. They skip when it is
+# unset, which is right for a quick local loop and wrong for CI — so CI sets
+# PORTAL_REQUIRE_DB_TESTS=1, which turns that skip into a failure. Run
+# `make db-up` to get a database locally; `make test-db` fails rather than skips.
+TEST_DB_PORT ?= 55432
+TEST_DB_URL  ?= postgres://portal:portal@127.0.0.1:$(TEST_DB_PORT)/portal_test?sslmode=disable
+
 # Every target here also runs in CI, and CI runs no target that is not here.
 # When the two drift, the local check stops meaning anything.
-.PHONY: all check build test vet fmt fmt-check generate generate-check layercheck lint-cookie clean
+.PHONY: all check build test test-db vet fmt fmt-check generate generate-check \
+        layercheck lint-cookie db-up db-down clean
 
 all: check
 
@@ -15,6 +23,22 @@ build:
 
 test:
 	$(GO) test -race -count=1 ./...
+
+# What CI runs: database tests must run, not skip.
+test-db:
+	PORTAL_TEST_DATABASE_URL="$(TEST_DB_URL)" PORTAL_REQUIRE_DB_TESTS=1 \
+		$(GO) test -race -count=1 ./...
+
+db-up:
+	docker rm -f triplebit-pg >/dev/null 2>&1 || true
+	docker run -d --name triplebit-pg \
+		-e POSTGRES_USER=portal -e POSTGRES_PASSWORD=portal -e POSTGRES_DB=portal_test \
+		-p $(TEST_DB_PORT):5432 postgres:17-alpine >/dev/null
+	@until docker exec triplebit-pg pg_isready -U portal -d portal_test >/dev/null 2>&1; do sleep 1; done
+	@echo "test database ready: $(TEST_DB_URL)"
+
+db-down:
+	docker rm -f triplebit-pg >/dev/null 2>&1 || true
 
 vet:
 	$(GO) vet ./...
