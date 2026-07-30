@@ -98,7 +98,11 @@ func (p *Pool) runOnce(ctx context.Context, iso pgx.TxIsoLevel, lock string, fn 
 // reproduces the contention.
 func backoff(ctx context.Context, attempt int) error {
 	const base = 2 * time.Millisecond
-	window := base << attempt
+	// The shift is clamped before the ceiling comparison: base << attempt
+	// overflows int64 around attempt 42, going negative before the ceiling
+	// check could catch it, and a negative window panics rand.Int64N. Retries
+	// is caller-controlled, so this is an input guard, not paranoia.
+	window := base << min(attempt, 7)
 	if window > 200*time.Millisecond {
 		window = 200 * time.Millisecond
 	}

@@ -369,3 +369,20 @@ func TestAccessAndPanicLogsCarryTheRealRequestID(t *testing.T) {
 		}
 	}
 }
+
+// A misconfigured empty base URL must reject mutations, not wave them
+// through. Unreachable through current callers, which is exactly when a
+// fail-open default gets forgotten.
+func TestRequireSameOriginFailsClosedOnEmptyBase(t *testing.T) {
+	t.Parallel()
+	handler := RequireSameOrigin("", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	r := httptest.NewRequest(http.MethodPost, "https://x.test/", nil)
+	r.Header.Set("Origin", "")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("empty base URL: status %d, want 403", w.Code)
+	}
+}

@@ -20,9 +20,13 @@
 #
 # The M3 gate: sign in through Pocket ID and land on /account showing your
 # own name, at http://localhost:8080.
+# Images are pinned to digests for the same reason GitHub Actions are pinned
+# to commit SHAs: a tag is mutable, and whoever controls the registry entry
+# can repoint it. The trailing tag comments are documentation; the digest is
+# what pulls. Update digests deliberately, the way action SHAs are updated.
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 # 17-alpine
     environment:
       POSTGRES_USER: portal
       POSTGRES_PASSWORD: portal
@@ -36,7 +40,7 @@ services:
       - db-data:/var/lib/postgresql/data
 
   pocket-id:
-    image: ghcr.io/pocket-id/pocket-id:v1
+    image: ghcr.io/pocket-id/pocket-id@sha256:f8cde808e8e840acda25683fc2168e0206e3f3fb1a48cca89d211aafd87eaeef # v1 (1.16.0)
     environment:
       APP_URL: http://pocket-id.localhost:1411
       TRUST_PROXY: "false"
@@ -87,8 +91,10 @@ services:
         condition: service_started
     # OIDC discovery runs at startup and Pocket ID may still be booting;
     # restarting until it answers is simpler and more honest than a fake
-    # readiness probe.
-    restart: on-failure
+    # readiness probe. Bounded, so a genuinely broken configuration is a
+    # visible dead container, not an infinite crash loop that undoes the
+    # binary's fail-fast posture.
+    restart: on-failure:5
 
 volumes:
   db-data:

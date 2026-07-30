@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
+	"triplebit.org/portal/internal/config"
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/migrations"
 )
@@ -21,15 +19,18 @@ func runMigrate(ctx context.Context, args []string) error {
 		return fmt.Errorf("expected no arguments, got %d", len(args))
 	}
 
-	dsn := strings.TrimSpace(os.Getenv("PORTAL_DATABASE_URL"))
-	if dsn == "" {
-		return errors.New("PORTAL_DATABASE_URL is required")
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if err := cfg.RequireMigrate(); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	pool, err := db.Open(ctx, dsn)
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}

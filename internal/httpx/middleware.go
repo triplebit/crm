@@ -132,6 +132,14 @@ func RequireSameOrigin(baseURL string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// An empty base URL must reject every mutating request, not accept
+		// them. Both current callers validate the URL before reaching here,
+		// so this is unreachable today — which is exactly when a fail-open
+		// default gets forgotten and inherited by a caller that does not.
+		if baseURL == "" {
+			http.Error(w, "Cross-origin request rejected.", http.StatusForbidden)
+			return
+		}
 		origin := strings.TrimRight(r.Header.Get("Origin"), "/")
 		if origin == "" {
 			referer := r.Referer()

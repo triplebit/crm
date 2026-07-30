@@ -118,20 +118,54 @@ Order draft → inventory reservation → Stripe Checkout Session → attach →
 redirect. Includes the crash-window recovery path for "Stripe created the
 Session but we died before storing its ID".
 
+**M5 and M6 are one deployable unit.** Between them, money moves and nothing
+records it. Fine as a milestone boundary; unacceptable as a deployed state.
+Nothing built in M5 reaches a live Stripe account until M6's gate passes.
+
 ### M6 — money in, durably
 
 Webhook inbox → canonical re-retrieval → projection. 17 event types, card only.
 `payment_intent.succeeded` and `invoice.paid` are the only settlement
 authorities; the checkout return page grants nothing.
 
+This is also **the worker's milestone**, because "the order settles by itself"
+is the worker doing its job. Its gate grows two clauses: a failed job visibly
+retries with backoff, and a permanently failing job lands in `staff_alerts`
+where a staff page shows it. A dead-letter queue nobody watches is not a
+control, and the schema's decision to defer the reconciliation sweeper leans
+on this queue being watched.
+
+Design to settle before M6's migration (batched as one): the webhook inbox
+needs the same lease columns `outbox_jobs` already has (a worker that dies
+mid-flight must not strand a paid order), `FOR UPDATE SKIP LOCKED` becomes the
+single claim pattern, the `observed_at` semantics for the out-of-order guard
+get pinned to canonical-retrieval time and tested with shuffled delivery, and
+`webhook_events.payload` gets a retention window — it is the one place raw
+PII would otherwise sit in the clear forever.
+
 ### M7 — staff can fulfill
 
-Launch candidate. The launch sentence must pass end to end.
+Launch candidate. The launch sentence must pass end to end. `bootstrap-staff`
+is part of this gate: granting the first administrator on a fresh database is
+a step the launch sentence silently depends on.
 
 ### M8 — deploy, rotation, privacy
 
 Compose plus Caddy, `rotate-pii`, the retention sweeper, subject-access export,
 a lean `doctor`, and about 400 lines of documentation replacing 7,583.
+
+Proposed additional gate, pending owner sign-off: **restore, not just backup.**
+The database is the sole source of truth for access and holds field-encrypted
+PII whose keys live in the process environment of one VPS; a restore without
+the matching keyring silently loses every ciphertext. The gate: restore onto a
+different machine, with the keyring, proven by a member signing in and reading
+their own settled order. Until that has happened once, the recovery posture is
+unknown.
+
+Before M5 writes the first PII ciphertext (`orders.imei_ciphertext`), settle
+the rotation design: a key-id column beside each ciphertext and a resumable
+rotation cursor, so `rotate-pii` can select rows instead of full-scanning. The
+first write freezes the representation.
 
 ### M9 — tax acknowledgments
 
@@ -167,6 +201,14 @@ Each is a route or a package, not a principle.
 | Device-replacement requirements | Re-enrolment policy; nobody has cancelled yet |
 | Nine-permission matrix | Two roles: `admin`, `fulfillment` |
 | Full Stripe re-observation sweeper | ~1,200 lines defending against an undelivered event |
+| Outbound email, entirely | V1 sends nothing: acknowledgments render in the portal, staff watch a queue page. When mail lands it is its own package with its own layer number — the layering tool's motivating anecdote is a persistence package that imported SMTP |
+
+This table, not the schema's `deferred past V1` comments, is the source of
+truth for V1 scope. The SQL comments are frozen inside migration 000001 and
+already disagree with the plan in two places (`acknowledgments` is deferred
+there but M9 is planned; `guest_donors` is deferred there but guest donations
+ship). When the M6 migration lands, the scope list moves into a Go file the
+build can actually check, and the SQL comments become pointers.
 
 **Cannot be cut**, because each is money- or access-correctness: webhook
 idempotency and the out-of-order guard; retrieve-canonical-before-project;
@@ -176,10 +218,12 @@ encryption; revocable sessions; audit writes; Serializable with retry.
 
 ## Decisions worth remembering
 
+The reasoning behind each lives in `docs/DECISIONS.md`; this table is the index.
+
 | | Decision |
 |---|---|
 | D1 | Adopt `stripe-go` v86. It has zero runtime dependencies, and its webhook verification and expandable-ID handling delete ~2,500 lines of hand-rolled code |
-| D2 | One migration, all 40 tables, frozen after first apply |
+| D2 | Migrations are append-only, per-file checksummed, and applied under an advisory lock; an applied file never changes. (Originally "one migration, frozen" — 000002 showed growth happens by appending, never by editing) |
 | D3 | One CSRF token per session; no path binding |
 | D4 | One source of truth per fact — the shape of the session fix |
 | D5 | Guest donations ship; the claim flow defers |
@@ -192,8 +236,12 @@ encryption; revocable sessions; audit writes; Serializable with retry.
 - **Two Stripe accounts mean two Billing Portals.** `bpc_` configurations are
   account-specific, so there is no single "manage my billing" page once Friends
   ships.
-- **Cross-account Customer Sharing is the highest-risk unproven integration.**
-  M5's sandbox test must assert propagation within a bounded time.
+- **Cross-account Customer Sharing is the highest-risk unproven integration**,
+  and two milestones assume it before M5 first tests it. As soon as the Stripe
+  sandbox Organization exists (an M4 dependency anyway), a throwaway spike
+  should create a Customer in one account and time its appearance in the other
+  — either confirming the propagation window or forcing the design change
+  while nothing depends on it.
 - **Card-only must stay enforced in code**, not as a Dashboard setting. Enabling
   ACH in the Stripe Dashboard would make four deferred event types load-bearing.
 

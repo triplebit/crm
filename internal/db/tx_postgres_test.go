@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/testdb"
@@ -137,7 +138,7 @@ func TestSerializationFailureIsRetriedTransparently(t *testing.T) {
 
 	for i, err := range errs {
 		if err != nil {
-			t.Errorf("transaction %d failed despite Retries=3: %v", i, err)
+			t.Errorf("transaction %d failed despite the retry budget: %v", i, err)
 		}
 	}
 }
@@ -257,5 +258,30 @@ func TestAdvisoryLockSerializesTransactionsSharingAKey(t *testing.T) {
 	}
 	if n != workers {
 		t.Errorf("n = %d, want %d: the advisory lock did not serialize the transactions", n, workers)
+	}
+}
+
+// A very large retry budget must not overflow the backoff shift into a
+// negative window, which panics the jitter. Uses a conflict-free callback, so
+// only the guard's arithmetic is in play; the test is that nothing panics
+// even at an attempt count far past where int64 << would go negative.
+func TestHugeRetryBudgetDoesNotPanicTheBackoff(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	attempts := 0
+	err := pool.WithTx(ctx, db.TxOptions{Retries: 100}, func(c db.Conn) error {
+		attempts++
+		if attempts < 45 {
+			// A retryable error, manufactured: serialization_failure SQLSTATE.
+			return &pgconn.PgError{Code: "40001"}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithTx: %v", err)
+	}
+	if attempts != 45 {
+		t.Errorf("callback ran %d times, want 45", attempts)
 	}
 }
