@@ -70,7 +70,7 @@ layercheck:
 # header. Centralising it is what makes a __Host- prefixed cookie with a
 # non-root path unrepresentable, rather than a mistake waiting to be repeated.
 lint-cookie:
-	@if grep -rn --include='*.go' -e 'http.SetCookie' -e '&http.Cookie{' -e '"__Host-' \
+	@if grep -rn --include='*.go' -e 'http.SetCookie' -e '&http.Cookie{' -e '"__Host-' -e '"Set-Cookie"' \
 		internal cmd 2>/dev/null | grep -v '^internal/cookie/'; then \
 		echo; echo "cookies must be written through internal/cookie only"; exit 1; \
 	fi

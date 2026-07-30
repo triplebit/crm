@@ -50,7 +50,6 @@ func (n Name) String() string {
 // Jar writes every cookie the portal sets.
 type Jar struct {
 	secure bool
-	now    func() time.Time
 }
 
 // NewJar derives cookie security from the base URL. Production must be https,
@@ -64,7 +63,7 @@ func NewJar(base *url.URL, env core.Environment) (*Jar, error) {
 	if env.IsProduction() && !secure {
 		return nil, fmt.Errorf("cookie: production requires an https base URL, got %q", base.Scheme)
 	}
-	return &Jar{secure: secure, now: time.Now}, nil
+	return &Jar{secure: secure}, nil
 }
 
 // Name qualifies a bare suffix such as "session" into a wire name, adding the

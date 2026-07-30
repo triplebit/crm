@@ -263,3 +263,54 @@ func TestForwardedHeaderIsIgnoredFromAnUntrustedPeer(t *testing.T) {
 			"proxy may assert a forwarded address", seen)
 	}
 }
+
+func TestRequestIDRejectsUnsafeClientValues(t *testing.T) {
+	t.Parallel()
+	handler := (Middleware{}).Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	// A well-formed inbound ID (e.g. set by Caddy) is kept, so a request can
+	// be traced across the proxy and the portal.
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("X-Request-ID", "caddy-1234.abc_DEF")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if got := response.Header().Get("X-Request-ID"); got != "caddy-1234.abc_DEF" {
+		t.Errorf("valid inbound request ID was replaced: got %q", got)
+	}
+
+	// Anything outside the safe charset is regenerated, never echoed: the
+	// value lands in the response header and in every log line.
+	for _, unsafe := range []string{
+		"id with spaces",
+		"quote\"break",
+		"non-ascii-\xc3\xa9",
+		"semi;colon",
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("X-Request-ID", unsafe)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		got := response.Header().Get("X-Request-ID")
+		if got == unsafe || got == "" {
+			t.Errorf("unsafe inbound ID %q: got %q, want a regenerated ID", unsafe, got)
+		}
+	}
+}
+
+func TestLoggingMiddlewareDoesNotSwallowFlusher(t *testing.T) {
+	t.Parallel()
+	handler := (Middleware{}).Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// The handler sees the statusRecorder wrapper, not the recorder
+		// itself; ResponseController must be able to reach through it.
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Errorf("Flush through the middleware chain failed: %v", err)
+		}
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !response.Flushed {
+		t.Fatal("Flush never reached the underlying writer")
+	}
+}

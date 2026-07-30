@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -34,10 +35,16 @@ func (m Middleware) Wrap(next http.Handler) http.Handler {
 	return m.recoverPanic(m.securityHeaders(m.requestLog(m.requestID(next))))
 }
 
+// requestIDPattern is what an inbound X-Request-ID must match to be reused.
+// The value is echoed into the response header and every log line for the
+// request, so arbitrary client bytes are not acceptable; anything that fails
+// the pattern is replaced, not rejected.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
 func (m Middleware) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
-		if requestID == "" || len(requestID) > 128 {
+		if !requestIDPattern.MatchString(requestID) {
 			var raw [16]byte
 			if _, err := rand.Read(raw[:]); err == nil {
 				requestID = hex.EncodeToString(raw[:])
@@ -307,3 +314,8 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	r.bytes += written
 	return written, err
 }
+
+// Unwrap lets http.ResponseController reach the underlying writer, so wrapping
+// a response in the logging middleware does not silently discard Flusher,
+// Hijacker or deadline support.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }

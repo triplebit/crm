@@ -16,6 +16,7 @@
 package redact
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 )
@@ -69,4 +70,5 @@ var (
 	_ fmt.Stringer   = Text{}
 	_ fmt.Formatter  = Text{}
 	_ slog.LogValuer = Text{}
+	_ json.Marshaler = Text{}
 )
