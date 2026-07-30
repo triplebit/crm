@@ -35,8 +35,21 @@ type CanonicalSession struct {
 	// ShippingName and ShippingAddress are what the member typed on Stripe's
 	// hosted page. They are read here and handed to staff on demand; per D9
 	// the portal stores neither.
-	ShippingName    string
-	ShippingAddress string
+	//
+	// `json:"-"` is what makes that true rather than merely stated. The comment
+	// above said the same thing while the projector marshalled this whole struct
+	// into stripe_projection_applications.canonical — whose own column comment
+	// also forbids address detail — writing plaintext addresses into the one
+	// table the worker can reach without a PII key. Three assertions of a
+	// property and no mechanism enforcing it.
+	//
+	// The tag is deliberately here rather than in a separate minimized audit
+	// struct: a DTO leaves this type marshalable, so the next caller to reach
+	// for json.Marshal reintroduces the leak. Unserializable at the source
+	// cannot be bypassed by accident. TestCanonicalSessionNeverSerializesAnAddress
+	// holds the line.
+	ShippingName    string `json:"-"`
+	ShippingAddress string `json:"-"`
 
 	// RetrievedAt is the instant this was read, and the ordering key for the
 	// out-of-order guard. See migration 000004: event.created would reject
