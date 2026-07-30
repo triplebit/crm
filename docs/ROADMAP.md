@@ -3,7 +3,7 @@
 Progress tracker for the rebuild. Every milestone ends in a command a human runs
 whose output is the gate — never "wrote package X".
 
-**Status: M4 next.**
+**Status: M5 next.**
 
 | | Milestone | Gate | Status |
 |---|---|---|---|
@@ -11,8 +11,8 @@ whose output is the gate — never "wrote package X".
 | M1 | Schema, migrations, `WithTx` | migrate twice; 40 tables; real 40001 retried | ✅ done |
 | M2 | Leaf packages | their tests, plus layering clean | ✅ done |
 | M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ✅ done |
-| M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ⬜ next |
-| M5 | Money out | a real test card reaches Stripe Checkout | ⬜ |
+| M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ✅ done |
+| M5 | Money out | a real test card reaches Stripe Checkout | ⬜ next |
 | M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ |
 | M7 | Staff can fulfill | the launch sentence, one person, one sitting | ⬜ |
 | M8 | Deploy, rotation, privacy | clean VPS, live Stripe, a real $1 donation | ⬜ |
@@ -109,10 +109,18 @@ loud instead of silently signing members out. And Pocket ID is addressed as
 `pocket-id.localhost` because WebAuthn refuses to register passkeys outside a
 secure context — a bug caught only by walking the real first-run setup.
 
-### M4 — the catalog is authoritative
+### M4 — the catalog is authoritative ✅
 
 The browser submits slugs and dollar strings only. The server resolves prices
 from an allowlisted catalog snapshot and parses cents itself, with no float.
+
+Gate passed against the real sandbox Organization: `catalog-sync` created all
+eight items — hotspot tiers and device in the memberships account, the four
+Friends tiers in the donations account — every local version was verified by
+reading the price back from Stripe, and the immediate re-run reported
+"8 unchanged, 0 created". Stripe refused an organization key carrying no
+Stripe-Context, which is the exact remote fail-closed behaviour the wrapper's
+design assumed.
 
 ### M5 — money out
 
@@ -244,12 +252,15 @@ The reasoning behind each lives in `docs/DECISIONS.md`; this table is the index.
 - **Two Stripe accounts mean two Billing Portals.** `bpc_` configurations are
   account-specific, so there is no single "manage my billing" page once Friends
   ships.
-- **Cross-account Customer Sharing is the highest-risk unproven integration**,
-  and two milestones assume it before M5 first tests it. As soon as the Stripe
-  sandbox Organization exists (an M4 dependency anyway), a throwaway spike
-  should create a Customer in one account and time its appearance in the other
-  — either confirming the propagation window or forcing the design change
-  while nothing depends on it.
+- **Cross-account Customer Sharing: the spike ran, and it does not propagate
+  yet.** 2026-07-30, real sandbox: a Customer created in the memberships
+  account stayed `resource_missing` in the donations account for a full
+  60 seconds. Most likely the Organization has no customer sharing group
+  configured (a Dashboard setting, not reachable by API key). BLOCKS the M5
+  shared-card design: either the owner enables sharing and the spike is
+  re-run to measure the real propagation window, or M5 falls back to
+  per-account Customers with no shared saved cards. Decide before M5's
+  EnsureCustomer is written.
 - **Card-only must stay enforced in code**, not as a Dashboard setting. Enabling
   ACH in the Stripe Dashboard would make four deferred event types load-bearing.
 
