@@ -3,10 +3,14 @@ package web
 import (
 	_ "embed"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"triplebit.org/portal/internal/auth"
+	"triplebit.org/portal/internal/checkout"
+	"triplebit.org/portal/internal/money"
+	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/web/viewdata"
 	"triplebit.org/portal/web/view"
 )
@@ -21,6 +25,8 @@ func (s *Server) registerRoutes() {
 	s.getLimited("/login", s.login)
 	s.getLimited("/auth/callback", s.callback)
 	s.getAuthed("/account", s.account)
+	s.getAuthed("/enroll", s.enrollForm)
+	s.post("/enroll", s.enrollSubmit)
 	s.post("/logout", s.logout)
 }
 
@@ -160,4 +166,84 @@ func (s *Server) healthz(c *reqctx) error {
 	c.w.Header().Set("Cache-Control", "no-store")
 	_, err := c.w.Write([]byte("ok\n"))
 	return err
+}
+
+// priceLabel renders "$75.00 / month", "$150.00 / 3 months", "$100.00 one time".
+func priceLabel(amount int64, recurringInterval string, intervalCount int64) string {
+	label := money.Cents(amount).Display()
+	switch {
+	case recurringInterval == "":
+		return label + " one time"
+	case intervalCount <= 1:
+		return label + " / " + recurringInterval
+	default:
+		return fmt.Sprintf("%s / %d %ss", label, intervalCount, recurringInterval)
+	}
+}
+
+func (s *Server) enrollData(c *reqctx) (viewdata.Enroll, error) {
+	layout, err := c.layout("Enroll")
+	if err != nil {
+		return viewdata.Enroll{}, err
+	}
+	offer, err := s.checkout.Offer(c.r.Context())
+	if err != nil {
+		return viewdata.Enroll{}, err
+	}
+	data := viewdata.Enroll{Layout: layout}
+	for _, tier := range offer.Tiers {
+		data.Tiers = append(data.Tiers, viewdata.EnrollTier{
+			Slug:       tier.Slug,
+			Name:       tier.Name,
+			PriceLabel: priceLabel(tier.Amount, tier.Interval, tier.IntervalCount),
+		})
+	}
+	if offer.DeviceAvailable {
+		data.DeviceAvailable = true
+		data.DevicePriceLabel = priceLabel(offer.DeviceAmount, "", 0)
+	}
+	return data, nil
+}
+
+func (s *Server) enrollForm(c *reqctx) error {
+	data, err := s.enrollData(c)
+	if err != nil {
+		return err
+	}
+	return view.Enroll(data).Render(c.r.Context(), c.w)
+}
+
+func (s *Server) enrollSubmit(c *reqctx) error {
+	req := checkout.EnrollmentRequest{
+		TierSlug:        c.r.PostForm.Get("tier"),
+		IncludeDevice:   c.r.PostForm.Get("device") == "yes",
+		IMEI:            c.r.PostForm.Get("imei"),
+		ShippingAddress: c.r.PostForm.Get("shipping_address"),
+	}
+	url, err := s.checkout.StartEnrollment(c.r.Context(), checkout.Person{
+		UserID: c.principal.User.ID,
+		Email:  c.principal.User.Email,
+		Name:   c.principal.User.DisplayName,
+	}, req)
+	if err != nil {
+		// A member-safe rejection re-renders the form with their input and
+		// the sentence; everything else is the router's problem.
+		if !safeerr.IsSafe(err) {
+			return err
+		}
+		data, dataErr := s.enrollData(c)
+		if dataErr != nil {
+			return dataErr
+		}
+		data.Error = safeerr.Message(err, "That did not work. Please check the form.")
+		data.TierSlug = req.TierSlug
+		data.IncludeDevice = req.IncludeDevice
+		data.IMEI = req.IMEI
+		data.ShippingAddress = req.ShippingAddress
+		c.w.WriteHeader(safeerr.StatusOf(err, http.StatusUnprocessableEntity))
+		return view.Enroll(data).Render(c.r.Context(), c.w)
+	}
+	// Off to Stripe's hosted page. 303, so a refresh cannot resubmit.
+	http.Redirect(c.w, c.r, url, http.StatusSeeOther)
+	return nil
 }

@@ -90,6 +90,9 @@ services:
       PORTAL_OIDC_CLIENT_ID: ${PORTAL_OIDC_CLIENT_ID:?create the client in Pocket ID first}
       PORTAL_OIDC_CLIENT_SECRET: ${PORTAL_OIDC_CLIENT_SECRET:?create the client in Pocket ID first}
       PORTAL_OIDC_REDIRECT_URL: http://localhost:8080/auth/callback
+      PORTAL_STRIPE_SECRET_KEY: ${PORTAL_STRIPE_SECRET_KEY:?set in .env — see .env.example}
+      PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT: ${PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT:?set in .env}
+      PORTAL_STRIPE_DONATIONS_ACCOUNT: ${PORTAL_STRIPE_DONATIONS_ACCOUNT:?set in .env}
     depends_on:
       migrate:
         condition: service_completed_successfully

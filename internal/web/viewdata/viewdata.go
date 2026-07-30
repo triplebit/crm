@@ -41,4 +41,32 @@ type Account struct {
 	// LoginMethod is the human phrasing, e.g. "a passkey".
 	LoginMethod string
 	Roles       []string
+
+	// Notice is a fixed sentence selected by the checkout return flags.
+	Notice string
+}
+
+// EnrollTier is one membership option, pre-priced ("$75.00 / month").
+type EnrollTier struct {
+	Slug       string
+	Name       string
+	PriceLabel string
+}
+
+// Enroll is the hotspot enrolment form.
+type Enroll struct {
+	Layout
+
+	Tiers []EnrollTier
+
+	DeviceAvailable  bool
+	DevicePriceLabel string
+
+	// Error is a member-safe sentence from a rejected submission, and the
+	// re-rendered form keeps what they typed.
+	Error           string
+	TierSlug        string
+	IncludeDevice   bool
+	IMEI            string
+	ShippingAddress string
 }

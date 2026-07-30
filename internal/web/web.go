@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"triplebit.org/portal/internal/auth"
+	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/cookie"
 	"triplebit.org/portal/internal/httpx"
 )
@@ -22,6 +23,7 @@ const maxFormBytes = 64 << 10
 type Options struct {
 	Sessions *auth.Sessions
 	OIDC     *auth.OIDC
+	Checkout *checkout.Service
 
 	Jar    *cookie.Jar
 	Logger *slog.Logger
@@ -50,6 +52,7 @@ type Server struct {
 
 	sessions    *auth.Sessions
 	oidc        *auth.OIDC
+	checkout    *checkout.Service
 	jar         *cookie.Jar
 	logger      *slog.Logger
 	authLimiter *httpx.RateLimiter
@@ -71,6 +74,8 @@ func New(opts Options) (http.Handler, error) {
 		return nil, errors.New("web: a session manager is required")
 	case opts.OIDC == nil:
 		return nil, errors.New("web: an OIDC client is required")
+	case opts.Checkout == nil:
+		return nil, errors.New("web: a checkout service is required")
 	case opts.Jar == nil:
 		return nil, errors.New("web: a cookie jar is required")
 	case opts.BaseURL == nil:
@@ -100,6 +105,7 @@ func New(opts Options) (http.Handler, error) {
 		mux:           http.NewServeMux(),
 		sessions:      opts.Sessions,
 		oidc:          opts.OIDC,
+		checkout:      opts.Checkout,
 		jar:           opts.Jar,
 		logger:        logger,
 		authLimiter:   authLimiter,

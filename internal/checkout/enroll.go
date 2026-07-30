@@ -152,7 +152,10 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, db.ErrInvalid) {
+		// ErrInvalid is the reserved <= on_hand check refusing to oversell;
+		// ErrNotFound is a tracked item with no inventory row at all. To the
+		// member both mean the same thing.
+		if errors.Is(err, db.ErrInvalid) || errors.Is(err, db.ErrNotFound) {
 			return "", safeerr.WithStatus(http.StatusConflict,
 				"That item is out of stock right now. Please try again later.")
 		}
@@ -273,4 +276,54 @@ func itemAccount(item catalogdb.Item) core.AccountRef {
 // lifted from another row (or the other column) fails to open.
 func orderAAD(orderID uuid.UUID, field string) []byte {
 	return []byte("triplebit-order:v1\x00" + orderID.String() + "|" + field)
+}
+
+// TierChoice is one enrolment option, priced.
+type TierChoice struct {
+	Slug          string
+	Name          string
+	Amount        int64
+	Currency      string
+	Interval      string
+	IntervalCount int64
+}
+
+// EnrollmentOffer is what the enrolment page shows: the tiers, and whether a
+// device can currently be added.
+type EnrollmentOffer struct {
+	Tiers []TierChoice
+
+	DeviceAvailable bool
+	DeviceAmount    int64
+}
+
+// Offer lists the current hotspot enrolment options from the verified
+// catalog.
+func (s *Service) Offer(ctx context.Context) (EnrollmentOffer, error) {
+	tiers, err := s.catalog.SellableByKind(ctx, s.pool.Conn(), s.env, core.Memberships, "hotspot_tier")
+	if err != nil {
+		return EnrollmentOffer{}, err
+	}
+	offer := EnrollmentOffer{}
+	for _, t := range tiers {
+		offer.Tiers = append(offer.Tiers, TierChoice{
+			Slug:          t.Item.Slug,
+			Name:          t.Item.Name,
+			Amount:        t.Version.Amount,
+			Currency:      t.Version.Currency,
+			Interval:      t.Version.Interval,
+			IntervalCount: t.Version.IntervalCount,
+		})
+	}
+	devices, err := s.catalog.SellableByKind(ctx, s.pool.Conn(), s.env, core.Memberships, "device")
+	if err != nil {
+		return EnrollmentOffer{}, err
+	}
+	for _, d := range devices {
+		if d.Item.Slug == "hotspot-device" {
+			offer.DeviceAvailable = true
+			offer.DeviceAmount = d.Version.Amount
+		}
+	}
+	return offer, nil
 }

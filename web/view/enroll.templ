@@ -1,0 +1,53 @@
+package view
+
+import "triplebit.org/portal/internal/web/viewdata"
+
+templ Enroll(d viewdata.Enroll) {
+	@page(d.Layout) {
+		<section class="enroll">
+			<h1>Hotspot membership</h1>
+			if d.Error != "" {
+				<p class="notice error">{ d.Error }</p>
+			}
+			<form method="post" action="/enroll">
+				<input type="hidden" name="_csrf" value={ d.CSRFToken }/>
+				<fieldset>
+					<legend>Choose a plan</legend>
+					for _, tier := range d.Tiers {
+						<label class="option">
+							<input type="radio" name="tier" value={ tier.Slug }
+								checked?={ tier.Slug == d.TierSlug }/>
+							<span>{ tier.Name }</span>
+							<strong>{ tier.PriceLabel }</strong>
+						</label>
+					}
+				</fieldset>
+				if d.DeviceAvailable {
+					<fieldset>
+						<legend>Device</legend>
+						<label class="option">
+							<input type="checkbox" name="device" value="yes" checked?={ d.IncludeDevice }/>
+							<span>Add a hotspot device (instead of bringing your own)</span>
+							<strong>{ d.DevicePriceLabel }</strong>
+						</label>
+					</fieldset>
+				}
+				<fieldset>
+					<legend>Your device</legend>
+					<label>
+						IMEI (14–16 digits, required for BYOD too)
+						<input type="text" name="imei" inputmode="numeric" required value={ d.IMEI }/>
+					</label>
+				</fieldset>
+				<fieldset>
+					<legend>Shipping</legend>
+					<label>
+						Where should we send your SIM card?
+						<textarea name="shipping_address" rows="4" required>{ d.ShippingAddress }</textarea>
+					</label>
+				</fieldset>
+				<button type="submit">Continue to payment</button>
+			</form>
+		</section>
+	}
+}

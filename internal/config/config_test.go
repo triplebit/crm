@@ -41,9 +41,9 @@ func setEnv(t *testing.T, overrides map[string]string) {
 		"PORTAL_TRUSTED_PROXY_CIDRS":        "",
 		"PORTAL_ENCRYPTION_PREVIOUS_KEYS":   "",
 		"PORTAL_SESSION_PREVIOUS_KEYS":      "",
-		"PORTAL_STRIPE_SECRET_KEY":          "",
-		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT": "",
-		"PORTAL_STRIPE_DONATIONS_ACCOUNT":   "",
+		"PORTAL_STRIPE_SECRET_KEY":          "sk_live_config_test",
+		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT": "acct_config_m",
+		"PORTAL_STRIPE_DONATIONS_ACCOUNT":   "acct_config_d",
 		"PORTAL_BRAND_NAME":                 "",
 		"PORTAL_BRAND_TAGLINE":              "",
 	}
@@ -381,7 +381,11 @@ func TestRequireWorkerDoesNotReferenceKeyRings(t *testing.T) {
 // catalog-sync needs the database and the Stripe credential set — and, like
 // the worker, must never be asked for browser or PII secrets.
 func TestRequireCatalogSyncNeedsStripeCredentials(t *testing.T) {
-	setEnv(t, nil)
+	setEnv(t, map[string]string{
+		"PORTAL_STRIPE_SECRET_KEY":          "",
+		"PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT": "",
+		"PORTAL_STRIPE_DONATIONS_ACCOUNT":   "",
+	})
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)

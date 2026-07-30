@@ -267,3 +267,61 @@ func (r *Repo) ItemBySlug(ctx context.Context, q db.Conn, slug string) (Item, er
 	}
 	return out, nil
 }
+
+// Sellable pairs an active item with its verified open price version.
+type Sellable struct {
+	Item    Item
+	Version PriceVersion
+}
+
+// SellableByKind lists what may be offered for one kind right now: active
+// items whose current version exists and has been verified against Stripe.
+// The verification filter is load-bearing — an unverified price must never
+// reach a member's screen, let alone their card.
+func (r *Repo) SellableByKind(ctx context.Context, q db.Conn, env core.StripeEnvironment, account core.AccountRef, kind string) ([]Sellable, error) {
+	rows, err := q.Query(ctx, `
+		SELECT i.id, i.slug, i.name, i.kind, i.program,
+		       i.requires_shipping, i.requires_imei, i.inventory_tracked, i.active,
+		       v.id, v.stripe_product_id, v.stripe_price_id,
+		       v.amount, v.currency, v.recurring, v.billing_interval, v.interval_count,
+		       v.active_from, v.verified_at
+		FROM catalog_items i
+		JOIN catalog_price_versions v ON v.catalog_item_id = i.id
+		WHERE i.kind = $1 AND i.active
+		  AND v.environment = $2 AND v.account_ref = $3
+		  AND v.active_until IS NULL AND v.verified_at IS NOT NULL
+		ORDER BY v.amount DESC
+	`, kind, env.String(), account.String())
+	if err != nil {
+		return nil, fmt.Errorf("catalogdb: sellable %q: %w", kind, db.Normalize(err))
+	}
+	defer rows.Close()
+
+	var out []Sellable
+	for rows.Next() {
+		s := Sellable{Version: PriceVersion{Environment: env, Account: account}}
+		var interval *string
+		var intervalCount *int64
+		if err := rows.Scan(
+			&s.Item.ID, &s.Item.Slug, &s.Item.Name, &s.Item.Kind, &s.Item.Program,
+			&s.Item.RequiresShipping, &s.Item.RequiresIMEI, &s.Item.InventoryTracked, &s.Item.Active,
+			&s.Version.ID, &s.Version.ProductID, &s.Version.PriceID,
+			&s.Version.Amount, &s.Version.Currency, &s.Version.Recurring, &interval, &intervalCount,
+			&s.Version.ActiveFrom, &s.Version.VerifiedAt,
+		); err != nil {
+			return nil, fmt.Errorf("catalogdb: scan sellable: %w", db.Normalize(err))
+		}
+		s.Version.CatalogItemID = s.Item.ID
+		if interval != nil {
+			s.Version.Interval = *interval
+		}
+		if intervalCount != nil {
+			s.Version.IntervalCount = *intervalCount
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalogdb: iterate sellable: %w", db.Normalize(err))
+	}
+	return out, nil
+}

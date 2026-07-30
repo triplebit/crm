@@ -176,6 +176,9 @@ func (c *Config) RequireServe() error {
 	l.require(c.OIDC.ClientID != "", "PORTAL_OIDC_CLIENT_ID is required")
 	l.require(c.OIDC.ClientSecret != "", "PORTAL_OIDC_CLIENT_SECRET is required")
 	l.require(c.OIDC.RedirectURL != "", "PORTAL_OIDC_REDIRECT_URL is required")
+	l.require(c.Stripe.SecretKey != "", "PORTAL_STRIPE_SECRET_KEY is required")
+	l.require(c.Stripe.MembershipsAccountID != "", "PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT is required")
+	l.require(c.Stripe.DonationsAccountID != "", "PORTAL_STRIPE_DONATIONS_ACCOUNT is required")
 
 	if c.Environment.IsProduction() {
 		l.require(strings.HasPrefix(c.OIDC.Issuer, "https://"),

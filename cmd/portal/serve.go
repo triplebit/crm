@@ -12,11 +12,17 @@ import (
 	"time"
 
 	"triplebit.org/portal/internal/auth"
+	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/config"
 	"triplebit.org/portal/internal/cookie"
+	"triplebit.org/portal/internal/core"
 	"triplebit.org/portal/internal/cryptox"
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/repo/accounts"
+	"triplebit.org/portal/internal/repo/catalogdb"
+	"triplebit.org/portal/internal/repo/customers"
+	"triplebit.org/portal/internal/repo/orders"
+	"triplebit.org/portal/internal/stripepay"
 	"triplebit.org/portal/internal/web"
 	"triplebit.org/portal/migrations"
 )
@@ -60,6 +66,10 @@ func runServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("session keyring: %w", err)
 	}
+	piiKeys, err := cryptox.NewKeyring(cfg.PII.ActiveID, cfg.PII.Material())
+	if err != nil {
+		return fmt.Errorf("PII keyring: %w", err)
+	}
 
 	repo := accounts.New()
 	sessions, err := auth.NewSessions(auth.SessionOptions{
@@ -85,6 +95,30 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	stripeEnv := core.StripeEnvironmentFor(cfg.Environment)
+	pay, err := stripepay.New(stripepay.Options{
+		APIKey:               cfg.Stripe.SecretKey,
+		Environment:          stripeEnv,
+		MembershipsAccountID: cfg.Stripe.MembershipsAccountID,
+		DonationsAccountID:   cfg.Stripe.DonationsAccountID,
+	})
+	if err != nil {
+		return err
+	}
+	checkoutSvc, err := checkout.New(checkout.Options{
+		Customers:   customers.New(),
+		Orders:      orders.New(),
+		Catalog:     catalogdb.New(),
+		Pool:        pool,
+		Pay:         pay,
+		Keys:        piiKeys,
+		Environment: stripeEnv,
+		BaseURL:     cfg.BaseURL.String(),
+	})
+	if err != nil {
+		return err
+	}
+
 	var proxyCIDRs []string
 	if cfg.TrustProxy {
 		proxyCIDRs = cfg.TrustedProxyCIDRs
@@ -92,6 +126,7 @@ func runServe(ctx context.Context, args []string) error {
 	handler, err := web.New(web.Options{
 		Sessions:          sessions,
 		OIDC:              oidc,
+		Checkout:          checkoutSvc,
 		Jar:               jar,
 		Logger:            logger,
 		BaseURL:           cfg.BaseURL,
