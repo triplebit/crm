@@ -422,3 +422,67 @@ func reservedCount(t *testing.T, pool *db.Pool, itemID uuid.UUID) int {
 	}
 	return reserved
 }
+
+// The window the review found: a stale order whose session was paid before the
+// portal got around to abandoning it.
+//
+// Stripe refuses to expire a completed session, and the whole safety argument
+// rests on that refusal — so it is worth proving rather than asserting. The
+// abandonment must fail, and crucially the stock must NOT be released: the
+// money arrived, so that stock is owed to the person who paid. The projector
+// settles the order on its next pass.
+func TestStaleOrderPaidBeforeAbandonmentKeepsItsStock(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	device := seedTier(t, pool, "hotspot-device", "device", false, 5)
+	cleanupOrders(t, pool, person.UserID)
+
+	req := enrollment(tier.Slug)
+	req.IncludeDevice = true
+	req.IMEI = ""
+	if _, err := svc.StartEnrollment(ctx, person, req); err != nil {
+		t.Fatalf("StartEnrollment: %v", err)
+	}
+	var sessionID string
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT stripe_checkout_session_id FROM orders WHERE user_id = $1`,
+		person.UserID).Scan(&sessionID); err != nil {
+		t.Fatalf("read session: %v", err)
+	}
+
+	// The member pays, then comes back after the resume window.
+	fake.SettleSession(sessionID, "pi_late1", "")
+	svc.SetClockForTest(func() time.Time { return time.Now().Add(30 * time.Hour) })
+
+	if _, err := svc.StartEnrollment(ctx, person, req); err == nil {
+		t.Fatal("a paid session was abandoned; its stock would have been given away")
+	}
+
+	// The order is untouched and its hold intact — the projector's job now.
+	var state string
+	var held int
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT state FROM orders WHERE user_id = $1`, person.UserID).Scan(&state); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if state != "checkout_pending" {
+		t.Errorf("order state = %s, want checkout_pending awaiting settlement", state)
+	}
+	if err := pool.Conn().QueryRow(ctx, `
+		SELECT count(*) FROM inventory_reservations r
+		JOIN order_lines l ON l.id = r.order_line_id
+		JOIN orders o ON o.id = l.order_id
+		WHERE o.user_id = $1 AND r.state = 'held'
+	`, person.UserID).Scan(&held); err != nil {
+		t.Fatalf("count held: %v", err)
+	}
+	if held != 1 {
+		t.Errorf("%d held reservations, want 1: paid stock must not be released", held)
+	}
+	if got := reservedCount(t, pool, device.ID); got != 1 {
+		t.Errorf("reserved = %d, want 1", got)
+	}
+}

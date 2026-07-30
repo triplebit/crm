@@ -410,6 +410,28 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		f.byIdem[idem] = obj
 		respond(obj)
 
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/expire"):
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/checkout/sessions/"), "/expire")
+		obj, ok := f.sessions[id]
+		if !ok {
+			notFound(w, "checkout session")
+			return
+		}
+		// Stripe refuses to expire a session that has completed, and the
+		// portal's safety argument depends on that refusal: an error here is
+		// how it learns the money arrived and the order must not be abandoned.
+		// A fake that expired anything would leave that argument untested.
+		if obj["status"] == "complete" || obj["payment_status"] == "paid" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": "You may only expire a Checkout Session that is open",
+			}})
+			return
+		}
+		obj["status"] = "expired"
+		respond(obj)
+
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/checkout/sessions/"):
 		f.sessionGets++
 		if obj, ok := f.sessions[strings.TrimPrefix(r.URL.Path, "/v1/checkout/sessions/")]; ok {
