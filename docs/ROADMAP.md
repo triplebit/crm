@@ -3,7 +3,7 @@
 Progress tracker for the rebuild. Every milestone ends in a command a human runs
 whose output is the gate — never "wrote package X".
 
-**Status: M5 next.**
+**Status: M6 next.**
 
 | | Milestone | Gate | Status |
 |---|---|---|---|
@@ -12,8 +12,8 @@ whose output is the gate — never "wrote package X".
 | M2 | Leaf packages | their tests, plus layering clean | ✅ done |
 | M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ✅ done |
 | M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ✅ done |
-| M5 | Money out | a real test card reaches Stripe Checkout | ⬜ next |
-| M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ |
+| M5 | Money out | a real test card reaches Stripe Checkout | ✅ done |
+| M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ next |
 | M7 | Staff can fulfill | the launch sentence, one person, one sitting | ⬜ |
 | M8 | Deploy, rotation, privacy | clean VPS, live Stripe, a real $1 donation | ⬜ |
 | M9 | Tax acknowledgments | a refund produces a correction revision | ⬜ |
@@ -122,7 +122,7 @@ reading the price back from Stripe, and the immediate re-run reported
 Stripe-Context, which is the exact remote fail-closed behaviour the wrapper's
 design assumed.
 
-### M5 — money out
+### M5 — money out ✅
 
 Order draft → inventory reservation → Stripe Checkout Session → attach →
 redirect. Includes the crash-window recovery path for "Stripe created the
@@ -140,6 +140,11 @@ Known UX gap for M7: a member with a pending order who submits a *different*
 valid choice is resumed to their existing checkout rather than told about it.
 The schema permits one pending order per programme, so nothing is lost — but
 the silence should become a sentence.
+
+Gate passed: the owner paid a $75/month tier plus a $100 device with a test
+card on Stripe's hosted page and was returned to the portal, which granted
+nothing — settlement is M6's business. Both giving paths were walked against
+the real sandbox too.
 
 **M5 and M6 are one deployable unit.** Between them, money moves and nothing
 records it. Fine as a milestone boundary; unacceptable as a deployed state.
