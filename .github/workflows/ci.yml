@@ -50,10 +50,15 @@ jobs:
       # tests stayed red from the baseline commit onward.
       PORTAL_REQUIRE_DB_TESTS: "1"
 
+    # Actions are pinned to full-length commit SHAs, not tags. A tag is mutable:
+    # whoever controls the action's repository can repoint it at new code, which
+    # then runs with access to this workflow's token. The organization enforces
+    # this, and it is worth keeping regardless. Each SHA was verified against the
+    # version named in the trailing comment before being committed.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
