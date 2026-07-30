@@ -3,6 +3,7 @@ package customers_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,5 +99,63 @@ func TestEnsureIntentReportsFreshness(t *testing.T) {
 	}
 	if second.OriginAccount != core.Memberships {
 		t.Errorf("origin account = %v, want the first caller's", second.OriginAccount)
+	}
+}
+
+// Concurrent identical observations must all succeed.
+//
+// The serial no-op is already covered above; this covers the case a member
+// actually produces by double-clicking Enroll, where several requests record
+// the same observation at once. The row violates two unique constraints when it
+// already exists — the ON CONFLICT arbiter, and the table's UNIQUE
+// (environment, account_ref, customer_id) — and this asserts the arbiter
+// absorbs the race rather than the other constraint raising.
+//
+// Sixteen goroutines writing the same observation: one inserts, fifteen must
+// find it already there and say so quietly.
+func TestConcurrentIdenticalObservationsAllSucceed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	repo := customers.New()
+	userID := seedUser(t, pool)
+	now := time.Now().UTC()
+	customerID := "cus_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+
+	const writers = 16
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // Release them together, to make the race likely.
+			errs <- repo.RecordCustomer(ctx, pool.Conn(), userID,
+				core.StripeSandbox, core.Memberships, customerID, now)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a concurrent identical observation failed: %v", err)
+		}
+	}
+
+	// Exactly one row, and it is the observation everybody made.
+	var rows int
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT count(*) FROM stripe_customers WHERE user_id = $1`, userID).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("%d rows for one person in one account, want 1", rows)
+	}
+	got, err := repo.CustomerIDFor(ctx, pool.Conn(), userID, core.StripeSandbox, core.Memberships)
+	if err != nil || got != customerID {
+		t.Errorf("stored customer = %q (%v), want %q", got, err, customerID)
 	}
 }

@@ -36,6 +36,13 @@ type Server struct {
 	// prefix makes every identifier this instance mints globally unique:
 	// tests share one PostgreSQL, whose unique indexes on Stripe identifiers
 	// would otherwise collide across tests that each run their own fake.
+	//
+	// It is 16 bytes, not 4. Two instances sharing a prefix would mint the same
+	// customer id for two different people, and stripe_customers has a UNIQUE
+	// (environment, account_ref, customer_id) — so the collision surfaces as a
+	// constraint violation in whichever test happens to run second, which reads
+	// as a product bug and is not one. 4 bytes made that astronomically
+	// unlikely rather than impossible; there is no reason to accept either.
 	prefix string
 
 	server    *httptest.Server
@@ -64,8 +71,12 @@ type Server struct {
 // New starts a fake Stripe server; it stops with the test.
 func New(t *testing.T) *Server {
 	t.Helper()
-	raw := make([]byte, 4)
-	_, _ = rand.Read(raw)
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		// A fake whose ids might collide is worse than no fake: the failure
+		// lands in an unrelated test as a constraint violation.
+		t.Fatalf("stripetest: read random prefix: %v", err)
+	}
 	f := &Server{
 		prefix:         hex.EncodeToString(raw),
 		byIdem:         map[string]map[string]any{},
