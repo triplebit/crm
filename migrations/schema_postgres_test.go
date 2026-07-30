@@ -352,8 +352,8 @@ func seedCatalogItem(t *testing.T, ctx context.Context, pool *db.Pool) uuid.UUID
 	id := uuid.New()
 	slug := "test-item-" + uuid.New().String()[:8]
 	if _, err := pool.Conn().Exec(ctx, `
-		INSERT INTO catalog_items (id, slug, name, sku, kind, program, inventory_tracked)
-		VALUES ($1, $2, 'Test item', $3, 'device', 'hotspot', true)
+		INSERT INTO catalog_items (id, slug, name, sku, kind, program)
+		VALUES ($1, $2, 'Test item', $3, 'device', 'hotspot')
 	`, id, slug, slug); err != nil {
 		t.Fatalf("seed catalog item: %v", err)
 	}

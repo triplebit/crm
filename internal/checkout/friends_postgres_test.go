@@ -98,18 +98,6 @@ func TestStartFriendsWithAFixedTier(t *testing.T) {
 	if amount != 2500 || priceID == "" {
 		t.Errorf("line amount=%d price=%q; a fixed tier must carry the catalog price", amount, priceID)
 	}
-	// Nothing ships, so nothing is reserved and no address is collected.
-	var holds int
-	if err := pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id WHERE l.order_id IN
-		(SELECT id FROM orders WHERE user_id = $1)
-	`, person.UserID).Scan(&holds); err != nil {
-		t.Fatalf("count holds: %v", err)
-	}
-	if holds != 0 {
-		t.Errorf("%d inventory holds for a donation", holds)
-	}
 	if got := fake.Session(sessionID, "mode"); got != "subscription" {
 		t.Errorf("session mode = %q, want subscription", got)
 	}

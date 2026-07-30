@@ -2,6 +2,7 @@ package stripesync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -427,5 +428,75 @@ func TestPriceIdempotencyKeyIsDeterministicAndPredecessorBound(t *testing.T) {
 	spec.Amount = 2000
 	if priceIdempotencyKey(core.StripeSandbox, core.Memberships, "tier", spec, "prod_1", "price_1") == a {
 		t.Error("a different amount produced the same key")
+	}
+}
+
+// An item marked out of stock stays out of stock across a sync.
+//
+// catalog_items.active is the portal's entire stock control: there is no
+// inventory counter, because hotspots come from a supplier that does not run
+// out. That makes this boolean the only thing standing between "we cannot supply
+// this today" and a member paying for it — and UpsertItem used to force it back
+// to true on every conflict, so an operator's emergency mark survived only until
+// the next catalog-sync silently put the item back on sale. Nothing would have
+// reported that; the sync would have said "1 unchanged".
+func TestSyncDoesNotUndoAManualOutOfStockMark(t *testing.T) {
+	ctx := context.Background()
+	f := stripetest.New(t)
+	s, pool := newSyncer(t, f)
+	slug := slugFor(t)
+	cleanupItem(t, pool, slug)
+	m := parseManifest(t, itemJSON(slug, "Sync Tier", "hotspot_tier", "15.00"))
+
+	if _, err := s.Sync(ctx, m); err != nil {
+		t.Fatalf("first Sync: %v", err)
+	}
+	repo := catalogdb.New()
+	if _, err := repo.SetItemAvailability(ctx, pool.Conn(), slug, false); err != nil {
+		t.Fatalf("mark out of stock: %v", err)
+	}
+
+	if _, err := s.Sync(ctx, m); err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+
+	item, err := repo.ItemBySlug(ctx, pool.Conn(), slug)
+	if err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if item.Active {
+		t.Error("catalog-sync put an item marked out of stock back on sale")
+	}
+
+	// And the mark is reversible, or it is a trap rather than a lever.
+	changed, err := repo.SetItemAvailability(ctx, pool.Conn(), slug, true)
+	if err != nil {
+		t.Fatalf("mark in stock: %v", err)
+	}
+	if !changed {
+		t.Error("re-marking in stock reported no change")
+	}
+	item, err = repo.ItemBySlug(ctx, pool.Conn(), slug)
+	if err != nil {
+		t.Fatalf("re-read item: %v", err)
+	}
+	if !item.Active {
+		t.Error("the item did not come back on sale")
+	}
+}
+
+// An unknown slug must be an error, not a reassuring no-op: the operator typing
+// it during an incident would otherwise believe they had stopped a sale.
+func TestSetItemAvailabilityRejectsAnUnknownSlug(t *testing.T) {
+	ctx := context.Background()
+	f := stripetest.New(t)
+	_, pool := newSyncer(t, f)
+
+	_, err := catalogdb.New().SetItemAvailability(ctx, pool.Conn(), "no-such-item-"+slugFor(t), false)
+	if err == nil {
+		t.Fatal("marking an unknown slug out of stock reported success")
+	}
+	if !errors.Is(err, db.ErrNotFound) {
+		t.Errorf("error %v is not db.ErrNotFound", err)
 	}
 }

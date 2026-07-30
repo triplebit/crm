@@ -11,8 +11,7 @@
         "interval": "year"
       },
       "requires_shipping": true,
-      "requires_imei": true,
-      "inventory_tracked": true
+      "requires_imei": true
     },
     {
       "slug": "hotspot-quarterly",
@@ -26,8 +25,7 @@
         "interval_count": 3
       },
       "requires_shipping": true,
-      "requires_imei": true,
-      "inventory_tracked": true
+      "requires_imei": true
     },
     {
       "slug": "hotspot-monthly",
@@ -40,8 +38,7 @@
         "interval": "month"
       },
       "requires_shipping": true,
-      "requires_imei": true,
-      "inventory_tracked": true
+      "requires_imei": true
     },
     {
       "slug": "hotspot-device",
@@ -49,7 +46,6 @@
       "kind": "device",
       "requires_shipping": true,
       "requires_imei": true,
-      "inventory_tracked": true,
       "price": {
         "amount": "100.00",
         "currency": "usd"

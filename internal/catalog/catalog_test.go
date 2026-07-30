@@ -21,7 +21,6 @@ const validManifest = `{
       "kind": "device",
       "requires_shipping": true,
       "requires_imei": true,
-      "inventory_tracked": true,
       "price": {"amount": "80.00", "currency": "usd"}
     },
     {

@@ -19,10 +19,10 @@ import (
 	"triplebit.org/portal/internal/testdb"
 )
 
-// seedTier inserts an active catalog item with a verified open price version
-// and, when stocked >= 0, an inventory row. Slugs are unique per test; the
-// device add-on uses the fixed slug the service resolves.
-func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, stocked int) catalogdb.Item {
+// seedTier inserts an active catalog item with a verified open price version.
+// Slugs are unique per test; the device add-on uses the fixed slug the service
+// resolves. Nothing seeds stock: the portal tracks no inventory.
+func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool) catalogdb.Item {
 	t.Helper()
 	ctx := context.Background()
 	repo := catalogdb.New()
@@ -31,7 +31,7 @@ func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, st
 	// and the open-version unique index would refuse the seed. Deleting is
 	// fragile (leaked orders hold foreign keys into the catalog), so leaked
 	// open versions are closed instead — harmless history — and the
-	// inventory seed below is an upsert. Never trust the previous run's
+	// Never trust the previous run's
 	// cleanup.
 	_, _ = pool.Conn().Exec(ctx, `
 		UPDATE catalog_price_versions SET active_until = now()
@@ -42,7 +42,7 @@ func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, st
 	item, err := repo.UpsertItem(ctx, pool.Conn(), catalogdb.Item{
 		Slug: slug, Name: "Test " + slug, Kind: kind,
 		Program:          "hotspot",
-		RequiresShipping: true, RequiresIMEI: true, InventoryTracked: stocked >= 0,
+		RequiresShipping: true, RequiresIMEI: true,
 	})
 	if err != nil {
 		t.Fatalf("seed item %s: %v", slug, err)
@@ -69,17 +69,6 @@ func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, st
 	if err := repo.MarkVerified(ctx, pool.Conn(), versionID, time.Now().UTC(), nil); err != nil {
 		t.Fatalf("verify version %s: %v", slug, err)
 	}
-	if stocked >= 0 {
-		if _, err := pool.Conn().Exec(ctx, `
-			INSERT INTO inventory (id, catalog_item_id, variant, on_hand, reserved, safety_stock)
-			VALUES ($1, $2, 'default', $3, 0, 0)
-			ON CONFLICT (catalog_item_id, variant)
-				DO UPDATE SET on_hand = EXCLUDED.on_hand, reserved = 0
-		`, uuid.New(), item.ID, stocked); err != nil {
-			t.Fatalf("seed inventory %s: %v", slug, err)
-		}
-	}
-
 	t.Cleanup(func() {
 		c := context.Background()
 		// Close rather than delete, for the same foreign-key reason as the
@@ -88,8 +77,6 @@ func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, st
 			UPDATE catalog_price_versions SET active_until = now()
 			WHERE active_until IS NULL AND catalog_item_id = $1
 		`, item.ID)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM inventory_reservations WHERE inventory_id IN (SELECT id FROM inventory WHERE catalog_item_id = $1)`, item.ID)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM inventory WHERE catalog_item_id = $1`, item.ID)
 		_, _ = pool.Conn().Exec(c, `DELETE FROM catalog_price_versions WHERE catalog_item_id = $1`, item.ID)
 		_, _ = pool.Conn().Exec(c, `DELETE FROM catalog_items WHERE id = $1`, item.ID)
 	})
@@ -117,8 +104,8 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
-	seedTier(t, pool, "hotspot-device", "device", false, 3)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
+	seedTier(t, pool, "hotspot-device", "device", false)
 	cleanupOrders(t, pool, person.UserID)
 
 	req := enrollment(tier.Slug)
@@ -156,7 +143,7 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 		t.Errorf("a shipping address was stored before settlement: %q", shipping)
 	}
 
-	var lines, reservations int
+	var lines int
 	var lineAmountSum int64
 	if err := pool.Conn().QueryRow(ctx, `
 		SELECT count(*), COALESCE(sum(amount), 0) FROM order_lines WHERE order_id = $1
@@ -166,17 +153,6 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 	if lines != 2 || lineAmountSum != 15000 {
 		t.Errorf("lines=%d sum=%d; want 2 lines totalling 15000", lines, lineAmountSum)
 	}
-	if err := pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		WHERE l.order_id = $1 AND r.state = 'held'
-	`, orderID).Scan(&reservations); err != nil {
-		t.Fatalf("count reservations: %v", err)
-	}
-	if reservations != 1 {
-		t.Errorf("%d held reservations, want 1 (the device; the tier is stockless in this test)", reservations)
-	}
-
 	// The Stripe side: subscription mode, the member's customer, the order
 	// reference, and card-only pinned by the wrapper.
 	if got := fake.Session(sessionID, "mode"); got != "subscription" {
@@ -187,23 +163,38 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 	}
 }
 
-// Overselling rolls back everything: the schema's reserved <= on_hand check
-// fails the reservation, and with it the order and its lines.
-func TestStartEnrollmentRefusesWhenOutOfStock(t *testing.T) {
+// The manual out-of-stock lever, end to end. There is no inventory counter —
+// hotspots come from a supplier that does not run out — so the only way to stop
+// selling something is catalog_items.active, and this proves that flipping it
+// refuses the enrolment with a member-visible message and leaves nothing behind.
+//
+// It replaces a test that proved the schema's reserved <= on_hand check rolled
+// an oversell back. That check guarded a subsystem this portal no longer has,
+// and which had never worked in production anyway: no code seeded an inventory
+// row, so a fresh database refused every hotspot enrolment as out of stock.
+func TestStartEnrollmentRefusesAnItemMarkedOutOfStock(t *testing.T) {
 	ctx := context.Background()
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
-	seedTier(t, pool, "hotspot-device", "device", false, 0) // none on hand
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
+	device := seedTier(t, pool, "hotspot-device", "device", false)
 	cleanupOrders(t, pool, person.UserID)
+
+	changed, err := catalogdb.New().SetItemAvailability(ctx, pool.Conn(), device.Slug, false)
+	if err != nil {
+		t.Fatalf("mark out of stock: %v", err)
+	}
+	if !changed {
+		t.Fatal("the device was already out of stock, so this test proves nothing")
+	}
 
 	req := enrollment(tier.Slug)
 	req.IncludeDevice = true
 	req.IMEI = ""
-	_, err := svc.StartEnrollment(ctx, person, req)
+	_, err = svc.StartEnrollment(ctx, person, req)
 	if err == nil {
-		t.Fatal("an out-of-stock device was sold")
+		t.Fatal("an item marked out of stock was sold")
 	}
 	if !safeerr.IsSafe(err) {
 		t.Errorf("out-of-stock error %v is not member-visible", err)
@@ -215,10 +206,15 @@ func TestStartEnrollmentRefusesWhenOutOfStock(t *testing.T) {
 		t.Fatalf("count orders: %v", err)
 	}
 	if orphans != 0 {
-		t.Errorf("%d order rows survived the rollback", orphans)
+		t.Errorf("%d order rows survived a refused enrolment", orphans)
 	}
 	if fake.SessionCount() != 0 {
-		t.Error("a checkout session was created for a failed order")
+		t.Error("a checkout session was created for a refused order")
+	}
+
+	// And the tier alone still sells: the lever is per item, not a global stop.
+	if _, err := svc.StartEnrollment(ctx, person, enrollment(tier.Slug)); err != nil {
+		t.Errorf("BYOD enrolment refused while only the device is out of stock: %v", err)
 	}
 }
 
@@ -230,7 +226,7 @@ func TestStartEnrollmentResumesTheCrashWindow(t *testing.T) {
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
 	cleanupOrders(t, pool, person.UserID)
 
 	url1, err := svc.StartEnrollment(ctx, person, enrollment(tier.Slug))
@@ -279,7 +275,7 @@ func TestStartEnrollmentValidation(t *testing.T) {
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
 	cleanupOrders(t, pool, person.UserID)
 
 	badIMEI := enrollment(tier.Slug)
@@ -317,8 +313,8 @@ func TestStaleOrderIsAbandonedRatherThanResumed(t *testing.T) {
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
-	device := seedTier(t, pool, "hotspot-device", "device", false, 5)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
+	seedTier(t, pool, "hotspot-device", "device", false)
 	cleanupOrders(t, pool, person.UserID)
 
 	req := enrollment(tier.Slug)
@@ -327,11 +323,6 @@ func TestStaleOrderIsAbandonedRatherThanResumed(t *testing.T) {
 	if _, err := svc.StartEnrollment(ctx, person, req); err != nil {
 		t.Fatalf("first StartEnrollment: %v", err)
 	}
-	reservedBefore := reservedCount(t, pool, device.ID)
-	if reservedBefore != 1 {
-		t.Fatalf("reserved = %d after enrolling, want 1", reservedBefore)
-	}
-
 	// Well past the resume window.
 	svc.SetClockForTest(func() time.Time { return time.Now().Add(30 * time.Hour) })
 	if _, err := svc.StartEnrollment(ctx, person, req); err != nil {
@@ -349,22 +340,6 @@ func TestStaleOrderIsAbandonedRatherThanResumed(t *testing.T) {
 	if expired != 1 || pending != 1 {
 		t.Errorf("orders: %d expired, %d pending; want 1 and 1 — the stale one abandoned, a fresh one created", expired, pending)
 	}
-	// The abandoned order's hold went back, and the new order took its own.
-	if got := reservedCount(t, pool, device.ID); got != 1 {
-		t.Errorf("reserved = %d, want 1: the stale hold must be released as the new one is taken", got)
-	}
-	var released int
-	if err := pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		JOIN orders o ON o.id = l.order_id
-		WHERE o.user_id = $1 AND r.state = 'released'
-	`, person.UserID).Scan(&released); err != nil {
-		t.Fatalf("count released: %v", err)
-	}
-	if released != 1 {
-		t.Errorf("%d released reservations, want 1", released)
-	}
 }
 
 // Two submissions racing past the pending-order check: the loser must be
@@ -374,7 +349,7 @@ func TestConcurrentSubmissionsResumeTheWinner(t *testing.T) {
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
 	cleanupOrders(t, pool, person.UserID)
 
 	const attempts = 4
@@ -413,31 +388,22 @@ func TestConcurrentSubmissionsResumeTheWinner(t *testing.T) {
 	}
 }
 
-func reservedCount(t *testing.T, pool *db.Pool, itemID uuid.UUID) int {
-	t.Helper()
-	var reserved int
-	if err := pool.Conn().QueryRow(context.Background(),
-		`SELECT reserved FROM inventory WHERE catalog_item_id = $1`, itemID).Scan(&reserved); err != nil {
-		t.Fatalf("read reserved: %v", err)
-	}
-	return reserved
-}
-
-// The window the review found: a stale order whose session was paid before the
+// The window a review found: a stale order whose session was paid before the
 // portal got around to abandoning it.
 //
 // Stripe refuses to expire a completed session, and the whole safety argument
 // rests on that refusal — so it is worth proving rather than asserting. The
-// abandonment must fail, and crucially the stock must NOT be released: the
-// money arrived, so that stock is owed to the person who paid. The projector
-// settles the order on its next pass.
-func TestStaleOrderPaidBeforeAbandonmentKeepsItsStock(t *testing.T) {
+// abandonment must fail and the order must stay exactly as it is: the money has
+// arrived and the projector settles it on the next pass. Abandoning it would
+// move a paid order to expired, and the projector would then find money against
+// an unpayable order and page a human for nothing.
+func TestStaleOrderPaidBeforeAbandonmentIsLeftAlone(t *testing.T) {
 	ctx := context.Background()
 	fake := stripetest.New(t)
 	svc, pool := newService(t, fake)
 	person := seedPerson(t, pool)
-	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
-	device := seedTier(t, pool, "hotspot-device", "device", false, 5)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true)
+	seedTier(t, pool, "hotspot-device", "device", false)
 	cleanupOrders(t, pool, person.UserID)
 
 	req := enrollment(tier.Slug)
@@ -458,12 +424,11 @@ func TestStaleOrderPaidBeforeAbandonmentKeepsItsStock(t *testing.T) {
 	svc.SetClockForTest(func() time.Time { return time.Now().Add(30 * time.Hour) })
 
 	if _, err := svc.StartEnrollment(ctx, person, req); err == nil {
-		t.Fatal("a paid session was abandoned; its stock would have been given away")
+		t.Fatal("a paid session was abandoned; the projector would then find money against an expired order")
 	}
 
-	// The order is untouched and its hold intact — the projector's job now.
+	// The order is untouched — the projector's job now.
 	var state string
-	var held int
 	if err := pool.Conn().QueryRow(ctx,
 		`SELECT state FROM orders WHERE user_id = $1`, person.UserID).Scan(&state); err != nil {
 		t.Fatalf("read state: %v", err)
@@ -471,18 +436,14 @@ func TestStaleOrderPaidBeforeAbandonmentKeepsItsStock(t *testing.T) {
 	if state != "checkout_pending" {
 		t.Errorf("order state = %s, want checkout_pending awaiting settlement", state)
 	}
-	if err := pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		JOIN orders o ON o.id = l.order_id
-		WHERE o.user_id = $1 AND r.state = 'held'
-	`, person.UserID).Scan(&held); err != nil {
-		t.Fatalf("count held: %v", err)
+	// And exactly one order survives: the failed abandonment must not have
+	// created a second while leaving the first payable.
+	var count int
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT count(*) FROM orders WHERE user_id = $1`, person.UserID).Scan(&count); err != nil {
+		t.Fatalf("count orders: %v", err)
 	}
-	if held != 1 {
-		t.Errorf("%d held reservations, want 1: paid stock must not be released", held)
-	}
-	if got := reservedCount(t, pool, device.ID); got != 1 {
-		t.Errorf("reserved = %d, want 1", got)
+	if count != 1 {
+		t.Errorf("%d orders, want 1", count)
 	}
 }

@@ -253,6 +253,17 @@ func (c *Config) RequireCatalogSync() error {
 	return l.err()
 }
 
+// RequireCatalogAvailability validates what the catalog-availability command
+// needs: the database and nothing else. It talks to no third party, so it is
+// usable during a Stripe outage — which is when an operator is most likely to
+// want an item off the offer — and like the worker it is never given the
+// session or PII key rings.
+func (c *Config) RequireCatalogAvailability() error {
+	l := &loader{}
+	l.require(c.DatabaseURL != "", "PORTAL_DATABASE_URL is required")
+	return l.err()
+}
+
 // loader accumulates problems so one run reports them all.
 type loader struct {
 	problems []string

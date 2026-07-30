@@ -65,7 +65,6 @@ type Item struct {
 	Program          string
 	RequiresShipping bool
 	RequiresIMEI     bool
-	InventoryTracked bool
 
 	Price PriceSpec
 }
@@ -91,7 +90,6 @@ type manifestJSON struct {
 		Kind             string `json:"kind"`
 		RequiresShipping bool   `json:"requires_shipping"`
 		RequiresIMEI     bool   `json:"requires_imei"`
-		InventoryTracked bool   `json:"inventory_tracked"`
 		Price            struct {
 			Amount        string `json:"amount"`
 			Currency      string `json:"currency"`
@@ -179,7 +177,6 @@ func Parse(r io.Reader) (Manifest, error) {
 			Program:          program,
 			RequiresShipping: entry.RequiresShipping,
 			RequiresIMEI:     entry.RequiresIMEI,
-			InventoryTracked: entry.InventoryTracked,
 			Price: PriceSpec{
 				Amount:        amount,
 				Currency:      currency,

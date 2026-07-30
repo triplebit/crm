@@ -151,7 +151,6 @@ func (s *Syncer) syncItem(ctx context.Context, item catalog.Item, result *Result
 		Program:          item.Program,
 		RequiresShipping: item.RequiresShipping,
 		RequiresIMEI:     item.RequiresIMEI,
-		InventoryTracked: item.InventoryTracked,
 	})
 	if err != nil {
 		return err

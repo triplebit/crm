@@ -34,7 +34,6 @@ type Item struct {
 	Program          string
 	RequiresShipping bool
 	RequiresIMEI     bool
-	InventoryTracked bool
 	Active           bool
 }
 
@@ -62,23 +61,27 @@ func (r *Repo) UpsertItem(ctx context.Context, q db.Conn, in Item) (Item, error)
 	err := q.QueryRow(ctx, `
 		INSERT INTO catalog_items (
 			id, slug, name, kind, program,
-			requires_shipping, requires_imei, inventory_tracked, active
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+			requires_shipping, requires_imei, active
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, true)
 		ON CONFLICT (slug) DO UPDATE SET
 			name              = EXCLUDED.name,
 			kind              = EXCLUDED.kind,
 			program           = EXCLUDED.program,
 			requires_shipping = EXCLUDED.requires_shipping,
 			requires_imei     = EXCLUDED.requires_imei,
-			inventory_tracked = EXCLUDED.inventory_tracked,
-			active            = true,
+			-- active is NOT reset here, and that is the point. It is the
+			-- operator's manual "stop offering this" lever (catalog-availability),
+			-- and forcing it back to true made an emergency mark hold only until
+			-- the next catalog-sync silently put the item back on sale — reported
+			-- as "1 unchanged". A sync reconciles prices with Stripe; it has no
+			-- opinion about whether we want to sell today.
 			updated_at        = now()
 		RETURNING id, slug, name, kind, program,
-		          requires_shipping, requires_imei, inventory_tracked, active
+		          requires_shipping, requires_imei, active
 	`, uuid.New(), in.Slug, in.Name, in.Kind, in.Program,
-		in.RequiresShipping, in.RequiresIMEI, in.InventoryTracked).
+		in.RequiresShipping, in.RequiresIMEI).
 		Scan(&out.ID, &out.Slug, &out.Name, &out.Kind, &out.Program,
-			&out.RequiresShipping, &out.RequiresIMEI, &out.InventoryTracked, &out.Active)
+			&out.RequiresShipping, &out.RequiresIMEI, &out.Active)
 	if err != nil {
 		return Item{}, fmt.Errorf("catalogdb: upsert item %q: %w", in.Slug, db.Normalize(err))
 	}
@@ -258,10 +261,10 @@ func (r *Repo) ItemBySlug(ctx context.Context, q db.Conn, slug string) (Item, er
 	var out Item
 	err := q.QueryRow(ctx, `
 		SELECT id, slug, name, kind, program,
-		       requires_shipping, requires_imei, inventory_tracked, active
+		       requires_shipping, requires_imei, active
 		FROM catalog_items WHERE slug = $1
 	`, slug).Scan(&out.ID, &out.Slug, &out.Name, &out.Kind, &out.Program,
-		&out.RequiresShipping, &out.RequiresIMEI, &out.InventoryTracked, &out.Active)
+		&out.RequiresShipping, &out.RequiresIMEI, &out.Active)
 	if err != nil {
 		return Item{}, fmt.Errorf("catalogdb: item %q: %w", slug, db.Normalize(err))
 	}
@@ -281,7 +284,7 @@ type Sellable struct {
 func (r *Repo) SellableByKind(ctx context.Context, q db.Conn, env core.StripeEnvironment, account core.AccountRef, kind string) ([]Sellable, error) {
 	rows, err := q.Query(ctx, `
 		SELECT i.id, i.slug, i.name, i.kind, i.program,
-		       i.requires_shipping, i.requires_imei, i.inventory_tracked, i.active,
+		       i.requires_shipping, i.requires_imei, i.active,
 		       v.id, v.stripe_product_id, v.stripe_price_id,
 		       v.amount, v.currency, v.recurring, v.billing_interval, v.interval_count,
 		       v.active_from, v.verified_at
@@ -304,7 +307,7 @@ func (r *Repo) SellableByKind(ctx context.Context, q db.Conn, env core.StripeEnv
 		var intervalCount *int64
 		if err := rows.Scan(
 			&s.Item.ID, &s.Item.Slug, &s.Item.Name, &s.Item.Kind, &s.Item.Program,
-			&s.Item.RequiresShipping, &s.Item.RequiresIMEI, &s.Item.InventoryTracked, &s.Item.Active,
+			&s.Item.RequiresShipping, &s.Item.RequiresIMEI, &s.Item.Active,
 			&s.Version.ID, &s.Version.ProductID, &s.Version.PriceID,
 			&s.Version.Amount, &s.Version.Currency, &s.Version.Recurring, &interval, &intervalCount,
 			&s.Version.ActiveFrom, &s.Version.VerifiedAt,
@@ -324,4 +327,37 @@ func (r *Repo) SellableByKind(ctx context.Context, q db.Conn, env core.StripeEnv
 		return nil, fmt.Errorf("catalogdb: iterate sellable: %w", db.Normalize(err))
 	}
 	return out, nil
+}
+
+// SetItemAvailability turns one item's offer on or off, reporting whether the
+// value actually changed.
+//
+// This is the portal's entire stock control: catalog_items.active, which every
+// sellable query already requires. There is no inventory counter — hotspots come
+// from a supplier that does not run out — so this boolean is the only thing
+// between "we cannot supply this today" and a member paying for it.
+//
+// It reports "changed" rather than "found" so an operator running it twice is
+// told the truth, and an unknown slug is db.ErrNotFound rather than a reassuring
+// success: during an incident, believing you have stopped a sale when you have
+// only mistyped a slug is the expensive failure.
+func (r *Repo) SetItemAvailability(ctx context.Context, q db.Conn, slug string, available bool) (bool, error) {
+	// The CTE captures the value before the write, because RETURNING sees the
+	// new row and so cannot answer "was this already the case?". No rows means
+	// no such slug, which Scan turns into db.ErrNotFound.
+	var changed bool
+	err := q.QueryRow(ctx, `
+		WITH before AS (
+			SELECT slug, active FROM catalog_items WHERE slug = $1
+		)
+		UPDATE catalog_items c
+		SET active = $2, updated_at = now()
+		FROM before b
+		WHERE c.slug = b.slug
+		RETURNING b.active IS DISTINCT FROM $2
+	`, slug, available).Scan(&changed)
+	if err != nil {
+		return false, fmt.Errorf("catalogdb: set availability for %q: %w", slug, db.Normalize(err))
+	}
+	return changed, nil
 }

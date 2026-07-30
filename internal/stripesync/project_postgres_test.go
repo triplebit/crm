@@ -190,16 +190,9 @@ func TestPaidSessionSettlesTheOrderByItself(t *testing.T) {
 		t.Error("the projector never retrieved the canonical session")
 	}
 
-	// Held stock becomes committed, and the membership appears with an anchor.
-	var committed, memberships int
+	// The membership appears with an anchor.
+	var memberships int
 	var anchor, source *uuid.UUID
-	if err := f.pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		WHERE l.order_id = $1 AND r.state = 'committed'
-	`, f.orderID).Scan(&committed); err != nil {
-		t.Fatalf("count committed: %v", err)
-	}
 	if err := f.pool.Conn().QueryRow(ctx, `
 		SELECT count(*) FROM memberships WHERE user_id = $1
 	`, f.person.UserID).Scan(&memberships); err != nil {
@@ -216,9 +209,6 @@ func TestPaidSessionSettlesTheOrderByItself(t *testing.T) {
 	}
 	if anchor == nil || source != nil {
 		t.Errorf("a catalog-priced tier must anchor on its price version (anchor=%v source=%v)", anchor, source)
-	}
-	if committed == 0 {
-		t.Log("no inventory on this tier, so nothing to commit — fine")
 	}
 }
 
@@ -306,16 +296,15 @@ func TestStaleObservationIsRefused(t *testing.T) {
 	}
 }
 
-// An expired session releases the stock it was holding — the other half of
-// reservation recovery, arriving from Stripe rather than from the sweep.
-func TestExpiredSessionReleasesReservations(t *testing.T) {
+// An expired session retires the order — the other half of recovery, arriving
+// from Stripe rather than from the sweep. Nothing is released because nothing
+// was held; what matters is that the order stops being payable and stops
+// blocking the member's next attempt.
+func TestExpiredSessionRetiresTheOrder(t *testing.T) {
 	f := newSettlement(t, "hotspot")
 
-	// Prove there is something to release first. Without this the assertion
-	// below passes against an order that never held any stock, which is what
-	// it did until the worker's sweep test tripped over the same gap.
-	if f.heldReservations(t) == 0 {
-		t.Fatal("the order holds no stock; this test would prove nothing")
+	if got := f.orderState(t); got != "checkout_pending" {
+		t.Fatalf("order starts as %s; this test would prove nothing", got)
 	}
 
 	f.fake.ExpireSession(f.sessionID)
@@ -325,23 +314,17 @@ func TestExpiredSessionReleasesReservations(t *testing.T) {
 	if got := f.orderState(t); got != "expired" {
 		t.Errorf("order state = %s, want expired", got)
 	}
-	if held := f.heldReservations(t); held != 0 {
-		t.Errorf("%d reservations still held after expiry", held)
-	}
-}
-
-// heldReservations counts the stock this order is holding.
-func (f *settlementFixture) heldReservations(t *testing.T) int {
-	t.Helper()
-	var held int
+	// And the member is free to start again: the one-pending-order index only
+	// blocks while an order sits in checkout_pending.
+	var pending int
 	if err := f.pool.Conn().QueryRow(context.Background(), `
-		SELECT count(*) FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		WHERE l.order_id = $1 AND r.state = 'held'
-	`, f.orderID).Scan(&held); err != nil {
-		t.Fatalf("count held reservations: %v", err)
+		SELECT count(*) FROM orders WHERE user_id = $1 AND state = 'checkout_pending'
+	`, f.person.UserID).Scan(&pending); err != nil {
+		t.Fatalf("count pending: %v", err)
 	}
-	return held
+	if pending != 0 {
+		t.Errorf("%d orders still pending after expiry; the member cannot start again", pending)
+	}
 }
 
 // A custom-amount Friends subscription anchors on its order line, because the
@@ -435,27 +418,15 @@ func seedSellable(t *testing.T, pool *db.Pool, program string) string {
 		kind, prog, account = "friends_tier", "friends", core.Donations
 	}
 	slug := "proj-" + uuid.New().String()[:8]
-	// A hotspot tier ships a SIM card and is inventory-tracked in production,
-	// so the fixture models that. It matters: with an untracked item the order
-	// holds no reservations, and every assertion here about stock being
-	// released would pass by describing nothing.
-	tracked := kind == "hotspot_tier"
+	// A hotspot tier ships a SIM card, so it requires shipping and an IMEI —
+	// but it holds no stock: the portal tracks no inventory at all.
+	ships := kind == "hotspot_tier"
 	item, err := repo.UpsertItem(ctx, pool.Conn(), catalogdb.Item{
 		Slug: slug, Name: "Projection " + slug, Kind: kind, Program: prog,
-		RequiresShipping: tracked, RequiresIMEI: tracked, InventoryTracked: tracked,
+		RequiresShipping: ships, RequiresIMEI: ships,
 	})
 	if err != nil {
 		t.Fatalf("seed item: %v", err)
-	}
-	if tracked {
-		if _, err := pool.Conn().Exec(ctx, `
-			INSERT INTO inventory (id, catalog_item_id, variant, on_hand, reserved, safety_stock)
-			VALUES ($1, $2, 'default', 5, 0, 0)
-			ON CONFLICT (catalog_item_id, variant)
-				DO UPDATE SET on_hand = EXCLUDED.on_hand, reserved = 0
-		`, uuid.New(), item.ID); err != nil {
-			t.Fatalf("seed inventory: %v", err)
-		}
 	}
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
 	versionID, err := repo.InsertPriceVersion(ctx, pool.Conn(), catalogdb.PriceVersion{

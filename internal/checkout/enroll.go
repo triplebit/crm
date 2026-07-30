@@ -31,16 +31,15 @@ import (
 // clock is now absent from the parameters entirely, so a resume is exact
 // however much later it arrives.
 //
-// The inventory hold spans that same window plus a margin, so stock is never
-// released while a member could still be paying for it.
+// Nothing here holds stock. The portal tracks no inventory: hotspots come from
+// a supplier that does not run out, and the manual lever for an emergency is
+// catalog_items.active (see the catalog-availability command), not a counter.
+// Removing reservations deleted the whole class of bug where a fresh database
+// refused every enrolment because no stock row existed.
 const (
-	sessionLifetime  = 24 * time.Hour
-	reservationGrace = 1 * time.Hour
-
 	// resumeWindow is how long a pending order may be resumed. It is shorter
-	// than the hold (sessionLifetime + reservationGrace) so a resumed page can
-	// never outlive the stock behind it, and shorter than Stripe's ~24-hour
-	// idempotency retention so a resume replays rather than re-creates.
+	// than Stripe's ~24-hour idempotency retention, so a resume replays the
+	// original session rather than minting a new, separately payable one.
 	resumeWindow = 20 * time.Hour
 )
 
@@ -152,7 +151,6 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		IdempotencyKey: "order:" + orderID.String(),
 	}
 
-	now := s.now().UTC()
 	err = s.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
 		var rows []orders.Line
 		for i, pending := range lines {
@@ -170,32 +168,12 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 				Currency:              pending.version.Currency,
 				Quantity:              pending.quantity,
 				RequiresShipping:      pending.item.RequiresShipping,
-				InventoryTracked:      pending.item.InventoryTracked,
 				Account:               core.Memberships,
 			})
 		}
-		if err := s.orders.CreatePending(ctx, c, order, rows); err != nil {
-			return err
-		}
-		for _, row := range rows {
-			if !row.InventoryTracked {
-				continue
-			}
-			if err := s.orders.Reserve(ctx, c, row.ID, row.CatalogItemID, row.Quantity,
-				now.Add(sessionLifetime+reservationGrace)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.orders.CreatePending(ctx, c, order, rows)
 	})
 	if err != nil {
-		// ErrInvalid is the reserved <= on_hand check refusing to oversell;
-		// ErrNotFound is a tracked item with no inventory row at all. To the
-		// member both mean the same thing.
-		if errors.Is(err, db.ErrInvalid) || errors.Is(err, db.ErrNotFound) {
-			return "", safeerr.WithStatus(http.StatusConflict,
-				"That item is out of stock right now. Please try again later.")
-		}
 		// Two submissions raced past the pending-order check and this one lost
 		// the unique index. The winner's order is the answer — which is what a
 		// double-click should get, rather than a 500.

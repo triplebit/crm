@@ -1,5 +1,5 @@
 // Package orders is the repository for money-out state: orders, their frozen
-// lines, inventory reservations, and the append-only state history.
+// lines and the append-only state history.
 //
 // An order line is a snapshot, not a reference: it copies the amount, name
 // and Stripe identifiers from the catalog version it was sold under, so a
@@ -44,9 +44,10 @@ type Order struct {
 	CheckoutURLExpiresAt *time.Time
 	IdempotencyKey       string
 
-	// CreatedAt bounds how long a pending order may be resumed: past the
-	// inventory hold window it is stale, and resurrecting it could hand out a
-	// payable Checkout page with no stock behind it.
+	// CreatedAt bounds how long a pending order may be resumed. Past that
+	// window Stripe has pruned the idempotency record, so replaying the key
+	// would mint a genuinely new payable session rather than return the
+	// original — which is why a stale order is abandoned, not resurrected.
 	CreatedAt time.Time
 }
 
@@ -65,7 +66,6 @@ type Line struct {
 	Currency              string
 	Quantity              int
 	RequiresShipping      bool
-	InventoryTracked      bool
 	Account               core.AccountRef
 }
 
@@ -89,13 +89,13 @@ func (r *Repo) CreatePending(ctx context.Context, q db.Conn, o Order, lines []Li
 			                         catalog_price_version_id, kind, slug, name,
 			                         stripe_product_id, stripe_price_id,
 			                         amount, currency, quantity,
-			                         requires_shipping, inventory_tracked, account_ref)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			                         requires_shipping, account_ref)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		`, line.ID, o.ID, line.LineNumber, nullUUID(line.CatalogItemID),
 			nullUUID(line.CatalogPriceVersionID), line.Kind, line.Slug, line.Name,
 			line.StripeProductID, line.StripePriceID,
 			line.Amount, line.Currency, line.Quantity,
-			line.RequiresShipping, line.InventoryTracked, line.Account.String())
+			line.RequiresShipping, line.Account.String())
 		if err != nil {
 			return fmt.Errorf("orders: create line %d: %w", line.LineNumber, db.Normalize(err))
 		}
@@ -108,29 +108,6 @@ func (r *Repo) CreatePending(ctx context.Context, q db.Conn, o Order, lines []Li
 		VALUES ($1, $2, NULL, 'checkout_pending', 'checkout started', 'member')
 	`, uuid.New(), o.ID); err != nil {
 		return fmt.Errorf("orders: record state history: %w", db.Normalize(err))
-	}
-	return nil
-}
-
-// Reserve holds inventory for one order line. The schema's
-// reserved <= on_hand check is the overselling gate: a reservation that
-// would exceed stock fails as db.ErrInvalid, and the caller's whole
-// transaction — order included — rolls back.
-func (r *Repo) Reserve(ctx context.Context, q db.Conn, lineID, catalogItemID uuid.UUID, quantity int, expiresAt time.Time) error {
-	var inventoryID uuid.UUID
-	err := q.QueryRow(ctx, `
-		UPDATE inventory SET reserved = reserved + $2, updated_at = now()
-		WHERE catalog_item_id = $1 AND variant = 'default'
-		RETURNING id
-	`, catalogItemID, quantity).Scan(&inventoryID)
-	if err != nil {
-		return fmt.Errorf("orders: reserve stock for item %s: %w", catalogItemID, db.Normalize(err))
-	}
-	if _, err := q.Exec(ctx, `
-		INSERT INTO inventory_reservations (id, inventory_id, order_line_id, quantity, state, expires_at)
-		VALUES ($1, $2, $3, $4, 'held', $5)
-	`, uuid.New(), inventoryID, lineID, quantity, expiresAt); err != nil {
-		return fmt.Errorf("orders: record reservation: %w", db.Normalize(err))
 	}
 	return nil
 }
@@ -193,7 +170,7 @@ func (r *Repo) Lines(ctx context.Context, q db.Conn, orderID uuid.UUID) ([]Line,
 		       COALESCE(catalog_item_id, '00000000-0000-0000-0000-000000000000'::uuid),
 		       COALESCE(catalog_price_version_id, '00000000-0000-0000-0000-000000000000'::uuid),
 		       kind, slug, name, stripe_product_id, stripe_price_id,
-		       amount, currency, quantity, requires_shipping, inventory_tracked, account_ref
+		       amount, currency, quantity, requires_shipping, account_ref
 		FROM order_lines WHERE order_id = $1 ORDER BY line_number
 	`, orderID)
 	if err != nil {
@@ -209,7 +186,7 @@ func (r *Repo) Lines(ctx context.Context, q db.Conn, orderID uuid.UUID) ([]Line,
 			&line.CatalogPriceVersionID, &line.Kind, &line.Slug, &line.Name,
 			&line.StripeProductID, &line.StripePriceID,
 			&line.Amount, &line.Currency, &line.Quantity,
-			&line.RequiresShipping, &line.InventoryTracked, &account); err != nil {
+			&line.RequiresShipping, &account); err != nil {
 			return nil, fmt.Errorf("orders: scan line: %w", db.Normalize(err))
 		}
 		parsed, err := core.ParseAccountRef(account)
@@ -256,25 +233,6 @@ func (r *Repo) Abandon(ctx context.Context, q db.Conn, orderID uuid.UUID, at tim
 		return false, nil
 	}
 
-	// Give the stock back before marking the reservation released, so a crash
-	// between the two leaves stock reserved rather than double-issued: the
-	// safe direction.
-	if _, err := q.Exec(ctx, `
-		UPDATE inventory i SET reserved = i.reserved - r.quantity, updated_at = now()
-		FROM inventory_reservations r
-		JOIN order_lines l ON l.id = r.order_line_id
-		WHERE r.inventory_id = i.id AND l.order_id = $1 AND r.state = 'held'
-	`, orderID); err != nil {
-		return false, fmt.Errorf("orders: release stock for %s: %w", orderID, db.Normalize(err))
-	}
-	if _, err := q.Exec(ctx, `
-		UPDATE inventory_reservations r
-		SET state = 'released', released_at = $2, updated_at = now()
-		FROM order_lines l
-		WHERE l.id = r.order_line_id AND l.order_id = $1 AND r.state = 'held'
-	`, orderID, at); err != nil {
-		return false, fmt.Errorf("orders: release reservations for %s: %w", orderID, db.Normalize(err))
-	}
 	if _, err := q.Exec(ctx, `
 		INSERT INTO order_state_history (id, order_id, from_state, to_state, reason, source)
 		VALUES ($1, $2, 'checkout_pending', 'expired', $3, 'system')
@@ -330,18 +288,6 @@ func (r *Repo) Settle(ctx context.Context, q db.Conn, orderID uuid.UUID, payment
 		return false, nil
 	}
 
-	// Held stock becomes committed: it has been paid for and is owed to a
-	// member. inventory.reserved stays as it is — the stock is still not
-	// available to anyone else — until fulfillment ships it and decrements
-	// on_hand, which is M7's business.
-	if _, err := q.Exec(ctx, `
-		UPDATE inventory_reservations r
-		SET state = 'committed', updated_at = now()
-		FROM order_lines l
-		WHERE l.id = r.order_line_id AND l.order_id = $1 AND r.state = 'held'
-	`, orderID); err != nil {
-		return false, fmt.Errorf("orders: commit reservations for %s: %w", orderID, db.Normalize(err))
-	}
 	if _, err := q.Exec(ctx, `
 		INSERT INTO order_state_history (id, order_id, from_state, to_state, reason, source)
 		VALUES ($1, $2, 'checkout_pending', 'paid', 'settled by verified webhook', 'stripe')

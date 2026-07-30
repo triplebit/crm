@@ -147,15 +147,18 @@ func TestWorkerEscalatesDeadLettersToStaffAlerts(t *testing.T) {
 	}
 }
 
-// The reservation leak, closed. A member who starts a device enrolment and
-// never comes back used to hold that unit forever: the member path abandons its
-// own stale order, but only if somebody returns to trigger it. Nobody does, so
-// the worker has to.
-func TestWorkerSweepReleasesStaleCheckoutStock(t *testing.T) {
+// Stale checkouts nobody returns to must be retired by the worker.
+//
+// The member path abandons its own stale order, but only if somebody comes back
+// to trigger it. Nobody does, so the worker has to — otherwise the order stays
+// in checkout_pending forever, its Stripe session stays payable for its full
+// 24 hours, and the one-pending-order index blocks that member from ever
+// starting again.
+func TestWorkerSweepRetiresStaleCheckouts(t *testing.T) {
 	f := newSettlement(t, "hotspot")
 
-	if f.heldReservations(t) == 0 {
-		t.Fatal("the order holds no stock; this test would prove nothing")
+	if got := f.orderState(t); got != "checkout_pending" {
+		t.Fatalf("order starts as %s; this test would prove nothing", got)
 	}
 
 	// A sweeper whose clock is a day ahead: the order is past its resume
@@ -167,18 +170,16 @@ func TestWorkerSweepReleasesStaleCheckoutStock(t *testing.T) {
 		return f.orderState(t) == "expired"
 	})
 
-	if held := f.heldReservations(t); held != 0 {
-		t.Errorf("%d reservations still held after the sweep", held)
-	}
-	// Unpayable before released: the session must be expired at Stripe, or for
-	// the next four hours a member could pay for stock somebody else now has.
+	// Unpayable, and at Stripe: an order retired locally whose session stays
+	// open for another four hours is money arriving for an order the portal has
+	// given up on, which is the case that pages a human.
 	if f.fake.Session(f.sessionID, "status") != "expired" {
-		t.Error("stock was released while the Checkout Session was still payable")
+		t.Error("the order was retired while its Checkout Session was still payable")
 	}
 }
 
 // The other half of that ordering, through the sweep: an order paid inside the
-// abandonment window keeps its stock. Stripe refuses to expire a completed
+// abandonment window is left alone. Stripe refuses to expire a completed
 // session, and that refusal is what stops the sweep — the money is already in,
 // and the projector owns the order now.
 func TestWorkerSweepLeavesAPaidStaleOrderAlone(t *testing.T) {
@@ -194,9 +195,6 @@ func TestWorkerSweepLeavesAPaidStaleOrderAlone(t *testing.T) {
 
 	if got := f.orderState(t); got != "checkout_pending" {
 		t.Errorf("order state = %s; a paid order must not be swept away before it settles", got)
-	}
-	if f.heldReservations(t) == 0 {
-		t.Error("the sweep released stock for an order that had already been paid")
 	}
 }
 

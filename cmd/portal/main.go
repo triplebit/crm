@@ -10,6 +10,7 @@
 //	portal worker           background queue and timer processor
 //	portal migrate          apply embedded SQL migrations
 //	portal catalog-sync     load the price manifest into the local catalog
+//	portal catalog-availability  stop or resume offering one item
 //	portal bootstrap-staff  grant the first local administrator
 //	portal rotate-pii       re-encrypt PII envelopes under the active key
 //	portal doctor           fail-closed pre-launch readiness gate
@@ -48,6 +49,8 @@ func main() {
 		err = runCatalogSync(context.Background(), args)
 	case "worker":
 		err = runWorker(context.Background(), args)
+	case "catalog-availability":
+		err = runCatalogAvailability(context.Background(), args)
 	case "bootstrap-staff", "rotate-pii", "doctor":
 		// Implemented in later milestones. Listed explicitly so an unimplemented
 		// subcommand reports that clearly, and a misspelling still exits 2.
@@ -112,9 +115,11 @@ Subcommands:
   worker           run the background queue and timer processor
   migrate          apply embedded SQL migrations
   catalog-sync     load the price manifest into the local catalog
-  bootstrap-staff  grant the first local administrator
-  rotate-pii       re-encrypt PII envelopes under the active key
-  doctor           fail-closed pre-launch readiness gate
+  catalog-availability <slug> in-stock|out-of-stock
+                   stop or resume offering one item (no Stripe call)
+  bootstrap-staff  grant the first local administrator (pending, M7)
+  rotate-pii       re-encrypt PII envelopes under the active key (pending, M8)
+  doctor           fail-closed pre-launch readiness gate (pending, M8)
   healthcheck      probe a running server
   version          print build information
 `)
