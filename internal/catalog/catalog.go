@@ -13,6 +13,7 @@ package catalog
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -110,6 +111,12 @@ func Parse(r io.Reader) (Manifest, error) {
 	var raw manifestJSON
 	if err := decoder.Decode(&raw); err != nil {
 		return Manifest{}, fmt.Errorf("catalog: manifest is not valid JSON: %w", err)
+	}
+	// One document, then EOF. A second JSON value after the manifest would
+	// otherwise be silently ignored — which for a price file means half of
+	// somebody's edit taking effect.
+	if err := decoder.Decode(new(json.RawMessage)); err != io.EOF {
+		return Manifest{}, errors.New("catalog: trailing content after the manifest; one JSON document only")
 	}
 
 	var problems []string

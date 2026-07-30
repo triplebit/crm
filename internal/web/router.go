@@ -175,7 +175,15 @@ func (s *Server) register(rt route, h handler) {
 // support message findable.
 func (s *Server) fail(c *reqctx, err error) {
 	requestID := httpx.RequestID(c.r.Context())
-	s.logger.ErrorContext(c.r.Context(), "request failed",
+	// A safe error is an expected, member-actionable rejection — it must not
+	// count against error-rate alerting, which is the whole reason it carries
+	// its own status. WARN keeps it visible; ERROR would page someone for a
+	// support case.
+	level := slog.LevelError
+	if safeerr.IsSafe(err) {
+		level = slog.LevelWarn
+	}
+	s.logger.Log(c.r.Context(), level, "request failed",
 		slog.String("request_id", requestID),
 		slog.String("method", c.r.Method),
 		slog.String("path", c.r.URL.Path),

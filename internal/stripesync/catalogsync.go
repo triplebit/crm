@@ -1,6 +1,8 @@
 // Package stripesync keeps local state and Stripe in agreement. Its first
 // job is the catalog push: the manifest is authoritative, the local database
-// records what was done, and Stripe is reconciled toward the manifest.
+// records what was done, and Stripe is reconciled toward the manifest — in
+// both directions. Presence creates and updates; absence retires. A slug
+// deleted from the manifest stops being sellable, locally and remotely.
 //
 // Every remote mutation carries a deterministic idempotency key derived from
 // what is being created and what it replaces. That is the crash-recovery
@@ -8,6 +10,12 @@
 // either replays to the same result (Stripe deduplicates on the key) or was
 // already recorded locally. There is no resume state to store, because the
 // procedure converges from the database and manifest alone.
+//
+// verified_at is earned, never assumed: it is set only after the price is
+// re-read from Stripe by ID and matches the version — product binding
+// included — and the product is re-read, active, and carries the slug that
+// created it. A create response is not evidence of what Stripe stored; a
+// retrieve is.
 package stripesync
 
 import (
@@ -76,23 +84,61 @@ type Result struct {
 	Unchanged int
 	Created   int
 	Rotated   int
+	Renamed   int
+	Retired   int
 	Verified  int
 }
 
 func (r Result) String() string {
-	return fmt.Sprintf("%d unchanged, %d created, %d rotated, %d verified",
-		r.Unchanged, r.Created, r.Rotated, r.Verified)
+	return fmt.Sprintf("%d unchanged, %d created, %d rotated, %d renamed, %d retired, %d verified",
+		r.Unchanged, r.Created, r.Rotated, r.Renamed, r.Retired, r.Verified)
 }
 
 // Sync reconciles the catalog and Stripe toward the manifest. It stops at the
-// first item that fails: a partial sync is safe (each item is independent and
+// first item that fails: a partial sync is safe (each step is independent and
 // convergent), but continuing past an error would bury it in later output.
+//
+// The whole run holds a per-environment advisory lock. Two concurrent syncs
+// with different manifests could otherwise both read the same predecessor,
+// create two successors remotely, and race the version swap — the loser's
+// successor would stay active in Stripe with no local row referencing it.
+// Sequential syncs converge; interleaved ones do not, so interleaving is
+// refused.
 func (s *Syncer) Sync(ctx context.Context, m catalog.Manifest) (Result, error) {
 	var result Result
+
+	// A dedicated session owns the advisory lock for the duration. The
+	// remote calls must not run inside a database transaction (WithTx's
+	// contract forbids it), so db.TxOptions.Lock is not usable here.
+	lockConn, err := s.pool.Pgx().Acquire(ctx)
+	if err != nil {
+		return result, fmt.Errorf("stripesync: acquire lock session: %w", err)
+	}
+	lockKey := "catalog-sync:" + s.env.String()
+	if _, err := lockConn.Exec(ctx,
+		`SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		lockConn.Release()
+		return result, fmt.Errorf("stripesync: lock %q: %w", lockKey, err)
+	}
+	defer func() {
+		// A session lock rides the connection, and Release returns the
+		// connection to the pool. If the unlock cannot be proven, the
+		// connection must die rather than hand a held lock to the pool's
+		// next borrower.
+		if _, err := lockConn.Exec(context.Background(),
+			`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey); err != nil {
+			_ = lockConn.Conn().Close(context.Background())
+		}
+		lockConn.Release()
+	}()
+
 	for _, item := range m.Items {
 		if err := s.syncItem(ctx, item, &result); err != nil {
 			return result, fmt.Errorf("stripesync: item %q: %w", item.Slug, err)
 		}
+	}
+	if err := s.retireAbsent(ctx, m, &result); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -114,25 +160,23 @@ func (s *Syncer) syncItem(ctx context.Context, item catalog.Item, result *Result
 
 	current, err := s.repo.CurrentPriceVersion(ctx, s.pool.Conn(), stored.ID, s.env, account)
 	switch {
-	case err == nil && versionMatches(current, item.Price):
-		// The common case: nothing changed. Verify once if never verified
-		// (a previous sync may have died between insert and verification);
-		// product display names are deliberately not reconciled here — the
-		// price is the load-bearing fact, and a rename takes effect at the
-		// next price rotation.
-		if current.VerifiedAt == nil {
-			if err := s.verify(ctx, account, current, item.Price); err != nil {
-				return err
-			}
-			result.Verified++
-		}
-		result.Unchanged++
-		return nil
-
 	case err == nil:
-		// The price changed: create the successor, retire the old price
-		// remotely, then swap the versions in one transaction. Run again
-		// after a crash at any point, every step replays or no-ops.
+		// The product is reconciled on every sync — reads are cheap for a
+		// catalog this size, and it is what lets a rename converge without
+		// waiting for a price change.
+		if err := s.reconcileProductName(ctx, account, current.ProductID, item, result); err != nil {
+			return err
+		}
+		if versionMatches(current, item.Price) {
+			if current.VerifiedAt == nil {
+				if err := s.verify(ctx, account, current.ID, current.PriceID, current.ProductID, item); err != nil {
+					return err
+				}
+				result.Verified++
+			}
+			result.Unchanged++
+			return nil
+		}
 		if err := s.rotate(ctx, account, stored, current, item); err != nil {
 			return err
 		}
@@ -151,10 +195,82 @@ func (s *Syncer) syncItem(ctx context.Context, item catalog.Item, result *Result
 	}
 }
 
+// retireAbsent is the other half of "the manifest is the source of truth":
+// any open version whose slug the manifest no longer lists — or whose account
+// is no longer where the manifest routes that slug, after a kind change —
+// has its remote price retired, its version closed, and (when the slug is
+// gone entirely) its item marked unsellable. Run again after a crash at any
+// point, every step replays or no-ops: the version is still open, so the
+// retirement is found again.
+func (s *Syncer) retireAbsent(ctx context.Context, m catalog.Manifest, result *Result) error {
+	desired := make(map[string]core.AccountRef, len(m.Items))
+	for _, item := range m.Items {
+		desired[item.Slug] = item.Account()
+	}
+
+	open, err := s.repo.OpenVersions(ctx, s.pool.Conn(), s.env)
+	if err != nil {
+		return err
+	}
+	now := s.now().UTC()
+	for _, ov := range open {
+		wantAccount, present := desired[ov.Slug]
+		if present && wantAccount == ov.Version.Account {
+			continue
+		}
+		if _, err := s.pay.DeactivatePrice(ctx, ov.Version.Account,
+			"catsync:deactivate:"+ov.Version.PriceID, ov.Version.PriceID); err != nil {
+			return fmt.Errorf("stripesync: retire %q: %w", ov.Slug, err)
+		}
+		err := s.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
+			if err := s.repo.ClosePriceVersion(ctx, c, ov.Version.ID, now); err != nil {
+				return err
+			}
+			if !present {
+				return s.repo.DeactivateItem(ctx, c, ov.Version.CatalogItemID)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("stripesync: retire %q: %w", ov.Slug, err)
+		}
+		result.Retired++
+	}
+	return nil
+}
+
+// reconcileProductName keeps Stripe's display name equal to the manifest's.
+func (s *Syncer) reconcileProductName(ctx context.Context, account core.AccountRef, productID string, item catalog.Item, result *Result) error {
+	product, err := s.pay.GetProduct(ctx, account, productID)
+	if err != nil {
+		return err
+	}
+	if product.Name == item.Name {
+		return nil
+	}
+	// The rename key is bound to the desired name: renaming X→Y→X within
+	// Stripe's idempotency window still produces fresh requests.
+	sum := sha256.Sum256([]byte(item.Name))
+	if _, err := s.pay.UpdateProductName(ctx, account,
+		"catsync:rename:"+productID+":"+hex.EncodeToString(sum[:8]),
+		productID, item.Name); err != nil {
+		return err
+	}
+	result.Renamed++
+	return nil
+}
+
 // create prices an item for the first time in this environment and account.
 func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored catalogdb.Item, item catalog.Item) error {
+	// The product key includes the name: a crash between the remote create
+	// and the local insert, followed by a manifest rename, must not replay
+	// the old key with different parameters — Stripe rejects that pairing
+	// outright and would wedge the sync for the idempotency window. A fresh
+	// key creates a second product and the first sits unreferenced, which
+	// converges; a wedged sync does not.
+	nameSum := sha256.Sum256([]byte(item.Name))
 	product, err := s.pay.CreateProduct(ctx, account,
-		fmt.Sprintf("catsync:product:%s:%s", s.env.String(), item.Slug),
+		fmt.Sprintf("catsync:product:%s:%s:%s", s.env.String(), item.Slug, hex.EncodeToString(nameSum[:8])),
 		stripepay.ProductSpec{Name: item.Name, Slug: item.Slug})
 	if err != nil {
 		return err
@@ -169,7 +285,7 @@ func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored cat
 	if err != nil {
 		return err
 	}
-	return s.markVerified(ctx, versionID, price, item.Price)
+	return s.verify(ctx, account, versionID, price.ID, product.ID, item)
 }
 
 // rotate replaces the current price with the manifest's.
@@ -204,27 +320,36 @@ func (s *Syncer) rotate(ctx context.Context, account core.AccountRef, stored cat
 	if err != nil {
 		return err
 	}
-	return s.markVerified(ctx, versionID, price, item.Price)
+	return s.verify(ctx, account, versionID, price.ID, current.ProductID, item)
 }
 
-// verify re-reads a price from Stripe and marks the version verified only if
-// what Stripe holds is what the database recorded. This is the M4 gate's
-// substance: the catalog is authoritative because it is checked, not assumed.
-func (s *Syncer) verify(ctx context.Context, account core.AccountRef, v catalogdb.PriceVersion, want catalog.PriceSpec) error {
-	remote, err := s.pay.GetPrice(ctx, account, v.PriceID)
+// verify earns verified_at: the price is re-read from Stripe by ID and must
+// match the version in every recorded dimension — including which product it
+// belongs to — and the product is re-read and must be active and carry the
+// slug that created it. A create response never enters this state directly:
+// it says what Stripe returned, not what Stripe stored.
+func (s *Syncer) verify(ctx context.Context, account core.AccountRef, versionID uuid.UUID, priceID, productID string, item catalog.Item) error {
+	remote, err := s.pay.GetPrice(ctx, account, priceID)
 	if err != nil {
 		return err
 	}
-	if err := matchesRemote(remote, want); err != nil {
+	if remote.ID != priceID || remote.ProductID != productID {
+		return fmt.Errorf("stripesync: price %s read back as %s under product %s; refusing to verify",
+			priceID, remote.ID, remote.ProductID)
+	}
+	if err := matchesRemote(remote, item.Price); err != nil {
 		return err
 	}
-	snapshot, _ := json.Marshal(remote)
-	return s.repo.MarkVerified(ctx, s.pool.Conn(), v.ID, s.now().UTC(), snapshot)
-}
-
-func (s *Syncer) markVerified(ctx context.Context, versionID uuid.UUID, remote stripepay.Price, want catalog.PriceSpec) error {
-	if err := matchesRemote(remote, want); err != nil {
+	product, err := s.pay.GetProduct(ctx, account, productID)
+	if err != nil {
 		return err
+	}
+	if !product.Active {
+		return fmt.Errorf("stripesync: product %s is inactive; refusing to verify price %s", productID, priceID)
+	}
+	if product.Slug != item.Slug {
+		return fmt.Errorf("stripesync: product %s carries slug %q, want %q; refusing to verify",
+			productID, product.Slug, item.Slug)
 	}
 	snapshot, _ := json.Marshal(remote)
 	return s.repo.MarkVerified(ctx, s.pool.Conn(), versionID, s.now().UTC(), snapshot)

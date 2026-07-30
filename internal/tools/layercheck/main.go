@@ -205,13 +205,20 @@ func check(pkgs []pkg, layers map[string]int) []string {
 		// R5: only the wrapper touches stripe-go. Checked against the raw
 		// import path because third-party imports are otherwise invisible to
 		// this tool — which is exactly how a rule like "catalog never imports
-		// the Stripe client" would erode.
+		// the Stripe client" would erode. Unlike the layering rules, R5 also
+		// covers test imports: a _test.go file that imports stripe-go can
+		// hand-build params with its own idempotency key and context, and
+		// "only through the wrapper" that exempts tests is not a rule, it is
+		// a suggestion. The wrapper's own tests are the single exception, by
+		// being the wrapper.
 		if local != stripeWrapperPkg {
-			for _, imp := range p.Imports {
-				if strings.HasPrefix(imp, stripeModule) {
-					problems = append(problems, fmt.Sprintf(
-						"%s imports %s: Stripe is reached only through %s",
-						local, imp, stripeWrapperPkg))
+			for _, imports := range [][]string{p.Imports, p.TestImports, p.XTestImports} {
+				for _, imp := range imports {
+					if strings.HasPrefix(imp, stripeModule) {
+						problems = append(problems, fmt.Sprintf(
+							"%s imports %s: Stripe is reached only through %s",
+							local, imp, stripeWrapperPkg))
+					}
 				}
 			}
 		}

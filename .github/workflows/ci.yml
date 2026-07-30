@@ -109,3 +109,6 @@ jobs:
 
       - name: compose file is valid
         run: make compose-check
+
+      - name: container image builds
+        run: make docker-check

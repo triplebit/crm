@@ -178,3 +178,76 @@ func (r *Repo) MarkVerified(ctx context.Context, q db.Conn, id uuid.UUID, at tim
 	}
 	return nil
 }
+
+// OpenVersion pairs an open price version with its item's slug, for the
+// retirement pass: sync must see everything that is currently sellable to
+// notice what the manifest no longer wants.
+type OpenVersion struct {
+	Version PriceVersion
+	Slug    string
+}
+
+// OpenVersions lists every open price version in one Stripe environment,
+// across both accounts.
+func (r *Repo) OpenVersions(ctx context.Context, q db.Conn, env core.StripeEnvironment) ([]OpenVersion, error) {
+	rows, err := q.Query(ctx, `
+		SELECT v.id, v.catalog_item_id, v.account_ref,
+		       v.stripe_product_id, v.stripe_price_id,
+		       v.amount, v.currency, v.recurring, v.billing_interval, v.interval_count,
+		       v.active_from, v.verified_at, i.slug
+		FROM catalog_price_versions v
+		JOIN catalog_items i ON i.id = v.catalog_item_id
+		WHERE v.environment = $1 AND v.active_until IS NULL
+		ORDER BY i.slug, v.account_ref
+	`, env.String())
+	if err != nil {
+		return nil, fmt.Errorf("catalogdb: list open versions: %w", db.Normalize(err))
+	}
+	defer rows.Close()
+
+	var out []OpenVersion
+	for rows.Next() {
+		v := PriceVersion{Environment: env}
+		var accountRef string
+		var interval *string
+		var intervalCount *int64
+		var slug string
+		if err := rows.Scan(&v.ID, &v.CatalogItemID, &accountRef,
+			&v.ProductID, &v.PriceID,
+			&v.Amount, &v.Currency, &v.Recurring, &interval, &intervalCount,
+			&v.ActiveFrom, &v.VerifiedAt, &slug); err != nil {
+			return nil, fmt.Errorf("catalogdb: scan open version: %w", db.Normalize(err))
+		}
+		account, err := core.ParseAccountRef(accountRef)
+		if err != nil {
+			return nil, fmt.Errorf("catalogdb: open version %s: %w", v.ID, err)
+		}
+		v.Account = account
+		if interval != nil {
+			v.Interval = *interval
+		}
+		if intervalCount != nil {
+			v.IntervalCount = *intervalCount
+		}
+		out = append(out, OpenVersion{Version: v, Slug: slug})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalogdb: iterate open versions: %w", db.Normalize(err))
+	}
+	return out, nil
+}
+
+// DeactivateItem marks an item unsellable. Its rows and history remain: the
+// catalog records what used to be sellable, forever.
+func (r *Repo) DeactivateItem(ctx context.Context, q db.Conn, id uuid.UUID) error {
+	tag, err := q.Exec(ctx, `
+		UPDATE catalog_items SET active = false, updated_at = now() WHERE id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("catalogdb: deactivate item %s: %w", id, db.Normalize(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("catalogdb: deactivate item %s: %w", id, db.ErrNotFound)
+	}
+	return nil
+}

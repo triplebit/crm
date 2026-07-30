@@ -30,6 +30,9 @@ type Product struct {
 	ID     string
 	Name   string
 	Active bool
+	// Slug is the portal_slug metadata written at creation; verification
+	// uses it to prove a product is the one the manifest line created.
+	Slug string
 }
 
 // PriceSpec describes a price to create. Amounts are integer minor units
@@ -186,7 +189,7 @@ func (c *Client) GetPrice(ctx context.Context, account core.AccountRef, priceID 
 }
 
 func toProduct(p *stripe.Product) Product {
-	return Product{ID: p.ID, Name: p.Name, Active: p.Active}
+	return Product{ID: p.ID, Name: p.Name, Active: p.Active, Slug: p.Metadata["portal_slug"]}
 }
 
 func toPrice(p *stripe.Price) Price {

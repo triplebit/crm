@@ -99,3 +99,15 @@ func TestManifestRejections(t *testing.T) {
 		}
 	}
 }
+
+// A manifest is one JSON document. Trailing content means somebody's edit
+// half-applied; refuse the file outright.
+func TestTrailingContentIsRejected(t *testing.T) {
+	t.Parallel()
+	if _, err := Parse(strings.NewReader(validManifest + `{"items": []}`)); err == nil {
+		t.Fatal("a manifest with trailing JSON parsed")
+	}
+	if _, err := Parse(strings.NewReader(validManifest + "  \n\t ")); err != nil {
+		t.Errorf("trailing whitespace was rejected: %v", err)
+	}
+}

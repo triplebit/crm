@@ -13,7 +13,7 @@ TEST_DB_URL  ?= postgres://portal:portal@127.0.0.1:$(TEST_DB_PORT)/portal_test?s
 # conveniences.)
 .PHONY: all check build test test-db vet fmt fmt-check generate generate-check \
         layercheck lint-cookie mod-verify vuln compose-check docker-build \
-        db-up db-down clean
+        docker-check db-up db-down clean
 
 all: check
 
@@ -109,9 +109,21 @@ compose-check:
 	docker compose config -q
 
 # Builds the container image with the revision stamped in, since the build
-# context deliberately excludes .git.
+# context deliberately excludes .git. A build from a modified worktree is
+# stamped <sha>-dirty: an image claiming a clean commit whose bytes are not
+# that commit is worse than one admitting it.
 docker-build:
-	PORTAL_REVISION=$$(git rev-parse HEAD) docker compose build
+	@rev=$$(git rev-parse HEAD); \
+	if ! git diff --quiet HEAD; then rev="$$rev-dirty"; fi; \
+	echo "building portal image at $$rev"; \
+	PORTAL_REVISION=$$rev docker compose build
+
+# The CI gate for the container: prove the Dockerfile builds from a clean
+# context. A digest bump or a Dockerfile edit that only fails at deploy time
+# is the kind of green-but-broken this repo exists to prevent — a FROM-line
+# comment did exactly that once, caught locally by luck.
+docker-check:
+	docker build --build-arg PORTAL_REVISION=ci-check -q . >/dev/null
 
 clean:
 	rm -rf bin

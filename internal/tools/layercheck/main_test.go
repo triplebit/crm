@@ -160,6 +160,19 @@ func TestStripeIsReachableOnlyThroughTheWrapper(t *testing.T) {
 	if problems := check([]pkg{wrapper}, testLayers); len(problems) != 0 {
 		t.Errorf("the wrapper itself was refused stripe-go: %q", problems)
 	}
+
+	// Test files are not an exemption: a _test.go importing stripe-go can
+	// hand-build params outside the wrapper's guarantees.
+	viaTest := pkg{
+		ImportPath:  mod("internal/checkout"),
+		TestImports: []string{"github.com/stripe/stripe-go/v86"},
+	}
+	assertOneProblemContaining(t, check([]pkg{viaTest}, testLayers), "only through internal/stripepay")
+	viaXTest := pkg{
+		ImportPath:   mod("internal/checkout"),
+		XTestImports: []string{"github.com/stripe/stripe-go/v86"},
+	}
+	assertOneProblemContaining(t, check([]pkg{viaXTest}, testLayers), "only through internal/stripepay")
 }
 
 // A scan that cannot see the binary package, or that sees implausibly few

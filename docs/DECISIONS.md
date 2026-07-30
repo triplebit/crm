@@ -14,9 +14,10 @@ expandable-ID handling and API pagination: ~2,500 lines that must be perfect.
 adoption. **Consequence.** Three library hazards must be neutralised in the
 wrapper (`internal/stripepay`, M4): no response size cap (wrap the transport),
 `BackendConfig.StripeContext` stays nil so a missing context is rejected by
-Stripe itself, and auto-generated idempotency keys are forbidden — a lint
-keeps `stripe.*Params` construction out of every other package, and
-layercheck R5 already keeps the import itself confined.
+Stripe itself, and auto-generated idempotency keys are forbidden. The
+enforcement is layercheck R5 alone — imports of `stripe-go`, test files
+included, are a build failure outside the wrapper, and code that cannot
+import the library cannot construct its params. There is no separate lint.
 
 ## D2 — migrations are append-only, per-file checksummed
 
