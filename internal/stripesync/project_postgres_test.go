@@ -453,3 +453,79 @@ func seedSellable(t *testing.T, pool *db.Pool, program string) string {
 
 	return slug
 }
+
+// receiveInvoice stores an invoice event: the payload object is an invoice that
+// references a subscription, which is the shape a renewal actually arrives in.
+func (f *settlementFixture) receiveInvoice(t *testing.T, eventType, invoiceID, subscriptionID string, account core.AccountRef) inbox.Event {
+	t.Helper()
+	id := uuid.New()
+	stripeID := "evt_" + strings.ReplaceAll(id.String(), "-", "")
+	payload, _ := json.Marshal(map[string]any{
+		"id": stripeID, "type": eventType,
+		"data": map[string]any{"object": map[string]any{
+			"id": invoiceID, "object": "invoice", "subscription": subscriptionID,
+		}},
+	})
+	event := inbox.Event{
+		ID: id, Environment: core.StripeSandbox, Account: account,
+		StripeID: stripeID, Type: eventType, ObjectID: invoiceID, Payload: payload,
+	}
+	now := time.Now().UTC()
+	if _, err := f.inbox.Receive(context.Background(), f.pool.Conn(), event, now, now); err != nil {
+		t.Fatalf("receive %s: %v", eventType, err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Conn().Exec(context.Background(),
+			`DELETE FROM webhook_events WHERE stripe_event_id = $1`, stripeID)
+	})
+	return event
+}
+
+// signalsFor lists every signal recorded against one Stripe object, which is how
+// a test asks "what did the projector decide about this?".
+//
+// It takes the object id rather than inferring it. An earlier version guessed
+// with an OR across the session, the order and the order's subscription, and
+// silently returned nothing for an application recorded against a subscription
+// before its order was settled — reading as "the projector did nothing" when the
+// projector had done exactly the right thing.
+func (f *settlementFixture) signalsFor(t *testing.T, objectID string) []string {
+	t.Helper()
+	rows, err := f.pool.Conn().Query(context.Background(), `
+		SELECT signal FROM stripe_projection_applications WHERE object_id = $1
+	`, objectID)
+	if err != nil {
+		t.Fatalf("read signals: %v", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan signal: %v", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate signals: %v", err)
+	}
+	return out
+}
+
+// seedFutureObservation records an application an hour ahead, so the next real
+// observation of the same object is genuinely older and the ordering guard must
+// refuse it.
+func (f *settlementFixture) seedFutureObservation(t *testing.T, objectID, eventType string) {
+	t.Helper()
+	_, err := billing.New().RecordApplication(context.Background(), f.pool.Conn(), billing.Application{
+		Environment: core.StripeSandbox, Account: core.Memberships,
+		StripeEvent: "evt_" + strings.ReplaceAll(uuid.New().String(), "-", ""),
+		EventType:   eventType, Signal: "seeded",
+		ObjectID:   objectID,
+		ObservedAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("seed future observation: %v", err)
+	}
+}

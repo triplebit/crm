@@ -153,9 +153,31 @@ Nothing built in M5 reaches a live Stripe account until M6's gate passes.
 
 ### M6 — money in, durably
 
-Webhook inbox → canonical re-retrieval → projection. 17 event types, card only.
-`payment_intent.succeeded` and `invoice.paid` are the only settlement
-authorities; the checkout return page grants nothing.
+Webhook inbox → canonical re-retrieval → projection. Card only, and **five**
+event types, every one of which changes something:
+
+| Event | Resolves through | Effect |
+|---|---|---|
+| `checkout.session.completed` | Checkout Session → order | settles the purchase |
+| `checkout.session.expired` | Checkout Session → order | retires the order |
+| `invoice.paid` | subscription → membership | advances the period (renewal) |
+| `customer.subscription.updated` | subscription → membership | status, cancel-at-period-end |
+| `customer.subscription.deleted` | subscription → membership | revokes access |
+
+The checkout return page grants nothing. `payment_intent.succeeded` is
+deliberately **not** handled: every payment here originates from a card-pinned
+Checkout Session and therefore completes synchronously, so
+`checkout.session.completed` is authoritative for one-time money and
+`invoice.paid` for recurring money. A payment-intent event would carry nothing
+those two do not.
+
+This table replaces a claim that was false in a way no test could see. Six types
+were listed as settlement authorities while four of them resolved nothing —
+`invoice.paid` and both subscription events carry no Checkout Session, so the
+session-only resolver recorded them as handled and projected nothing. A renewal
+therefore never advanced a membership and a cancellation never revoked one: a
+member could keep paying and lose access at the end of their first period. See
+[[executable-claims]] in project memory for the pattern this belongs to.
 
 This is also **the worker's milestone**, because "the order settles by itself"
 is the worker doing its job. Its gate grows two clauses: a failed job visibly

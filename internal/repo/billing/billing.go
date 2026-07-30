@@ -187,3 +187,34 @@ func (r *Repo) RaiseAlert(ctx context.Context, q db.Conn, env core.StripeEnviron
 	}
 	return nil
 }
+
+// UpdateMembershipLifecycle applies Stripe's current view of a subscription to
+// the membership it already created, reporting whether a row matched.
+//
+// This is the renewal and cancellation path, and it is deliberately narrower
+// than UpsertMembership: it touches only the columns Stripe owns the truth
+// about, and it cannot insert. A subscription event carries no user, program or
+// price anchor, so a version of this that inserted would have to invent them —
+// and a membership conjured from a renewal notice is a membership with no order
+// behind it.
+//
+// The boolean is the interesting part. False means Stripe is telling us about a
+// subscription we have no membership for, which the caller must interpret rather
+// than ignore: usually the initial settlement simply has not been processed yet.
+func (r *Repo) UpdateMembershipLifecycle(ctx context.Context, q db.Conn, env core.StripeEnvironment,
+	account core.AccountRef, subscriptionID, status string,
+	currentPeriodEnd *time.Time, cancelAtPeriodEnd bool,
+) (bool, error) {
+	tag, err := q.Exec(ctx, `
+		UPDATE memberships
+		SET status               = $4,
+		    current_period_end   = COALESCE($5, current_period_end),
+		    cancel_at_period_end = $6,
+		    updated_at           = now()
+		WHERE environment = $1 AND account_ref = $2 AND stripe_subscription_id = $3
+	`, env.String(), account.String(), subscriptionID, status, currentPeriodEnd, cancelAtPeriodEnd)
+	if err != nil {
+		return false, fmt.Errorf("billing: update membership for %s: %w", subscriptionID, db.Normalize(err))
+	}
+	return tag.RowsAffected() == 1, nil
+}

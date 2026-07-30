@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Server is one fake Stripe instance. Fields are guarded by mu; tests read
@@ -207,6 +208,68 @@ func (f *Server) SettleSession(id, paymentIntentID, subscriptionID string) {
 			}}},
 		}
 	}
+}
+
+// RenewSubscription moves a subscription's period forward, as Stripe does when a
+// renewal invoice is paid. Returns false if the subscription is unknown, so a
+// test cannot quietly assert against nothing.
+func (f *Server) RenewSubscription(id string, newPeriodEnd time.Time) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		items, _ := obj["items"].(map[string]any)
+		data, _ := items["data"].([]any)
+		if len(data) > 0 {
+			if item, ok := data[0].(map[string]any); ok {
+				item["current_period_end"] = newPeriodEnd.Unix()
+			}
+		}
+		obj["status"] = "active"
+	})
+}
+
+// CancelSubscription marks a subscription canceled, as Stripe does on deletion.
+func (f *Server) CancelSubscription(id string) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		obj["status"] = "canceled"
+		obj["cancel_at_period_end"] = false
+	})
+}
+
+// ScheduleCancellation sets cancel_at_period_end, the state a member reaches by
+// cancelling without asking for a refund: still active, will not renew.
+func (f *Server) ScheduleCancellation(id string) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		obj["cancel_at_period_end"] = true
+	})
+}
+
+// SetSubscriptionStatus forces any Stripe subscription status, including the
+// dunning states (past_due, unpaid) a card failure produces.
+func (f *Server) SetSubscriptionStatus(id, status string) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		obj["status"] = status
+	})
+}
+
+func (f *Server) mutateSubscription(id string, apply func(map[string]any)) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.subscriptions[id]
+	if !ok {
+		return false
+	}
+	apply(obj)
+	return true
+}
+
+// SubscriptionField reads a stored subscription's field, for assertions about
+// what the fake believes.
+func (f *Server) SubscriptionField(id, field string) any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if obj, ok := f.subscriptions[id]; ok {
+		return obj[field]
+	}
+	return nil
 }
 
 // ExpireSession marks a session expired, as Stripe would after its window.

@@ -339,3 +339,29 @@ func (r *Repo) ExpiredPending(ctx context.Context, q db.Conn, env core.StripeEnv
 	}
 	return found, nil
 }
+
+// SubscriptionIsKnown reports whether any order in this account has already
+// been settled against a Stripe subscription.
+//
+// It exists to tell two situations apart when a renewal arrives for a
+// subscription with no local membership. If no order names the subscription,
+// the initial settlement has not been processed yet and the renewal is simply
+// early — harmless, because settlement reads canonical subscription state and
+// will record the right period. If an order does name it, the settlement DID
+// run and produced no membership, which is a defect a human must see.
+func (r *Repo) SubscriptionIsKnown(ctx context.Context, q db.Conn, env core.StripeEnvironment,
+	account core.AccountRef, subscriptionID string,
+) (bool, error) {
+	var exists bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM orders
+			WHERE environment = $1 AND account_ref = $2
+			  AND stripe_subscription_id = $3
+		)
+	`, env.String(), account.String(), subscriptionID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("orders: subscription %s known: %w", subscriptionID, db.Normalize(err))
+	}
+	return exists, nil
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,21 +18,47 @@ import (
 	"triplebit.org/portal/internal/stripepay"
 )
 
-// settlementTypes are the only event types that may move an order to paid.
+// route says how an event type is resolved to local state. Every type listed
+// here changes something; anything absent is recorded as ignored.
+type route int
+
+const (
+	// viaSession resolves through the Checkout Session the event names, to the
+	// order it settled. This is money arriving for a purchase.
+	viaSession route = iota + 1
+
+	// viaSubscription resolves through the Stripe subscription the event names,
+	// to the membership already projected for it. This is the recurring
+	// lifecycle: renewal, cancellation, status change.
+	viaSubscription
+)
+
+// eventRouting is the complete set of events that grant, revoke or retire
+// anything. It is short on purpose — Stripe emits dozens of types, and treating
+// any of them as authority is how a portal grants access from a page load.
 //
-// The list is short on purpose. Stripe emits dozens of types; treating any of
-// them as settlement authority is how a portal ends up granting access from a
-// page load or a pending intent. A card payment settles on
-// payment_intent.succeeded; a subscription's first (and every) period settles
-// on invoice.paid; checkout.session.completed is the convenient hook that ties
-// either to a local order. Nothing else here grants anything.
-var settlementTypes = map[string]bool{
-	"checkout.session.completed":    true,
-	"payment_intent.succeeded":      true,
-	"invoice.paid":                  true,
-	"checkout.session.expired":      true,
-	"customer.subscription.updated": true,
-	"customer.subscription.deleted": true,
+// It is also *only* types that actually do something, which it did not use to
+// be. Six types were listed as settlement authorities while four of them
+// resolved nothing: payment_intent.succeeded, invoice.paid and both
+// subscription events carry no Checkout Session, so the session-only resolver
+// returned "no local order reference" and recorded them as handled. The visible
+// consequence was that renewals never advanced a membership and cancellations
+// never revoked one — a member could keep paying and lose access at the end of
+// their first period. Recording an event as processed while projecting nothing
+// is the worst of the available failures: it is durable and it is silent.
+//
+// payment_intent.succeeded is deliberately absent rather than routed. Every
+// payment in this portal originates from a Checkout Session pinned to cards, so
+// it completes synchronously and checkout.session.completed is authoritative for
+// one-time money; invoice.paid is authoritative for recurring money. A payment
+// intent event would carry nothing those two do not, and a type that resolves
+// nothing has no business being called an authority.
+var eventRouting = map[string]route{
+	"checkout.session.completed":    viaSession,
+	"checkout.session.expired":      viaSession,
+	"invoice.paid":                  viaSubscription,
+	"customer.subscription.updated": viaSubscription,
+	"customer.subscription.deleted": viaSubscription,
 }
 
 // Projector turns received webhook events into settled local state.
@@ -97,15 +124,16 @@ func (p *Projector) ProcessOne(ctx context.Context, leaseFor time.Duration) (boo
 		return false, err
 	}
 
-	if !settlementTypes[event.Type] {
+	via, handled := eventRouting[event.Type]
+	if !handled {
 		// Recorded as ignored rather than dropped, so "never delivered" and
 		// "delivered and irrelevant" stay distinguishable when someone asks
 		// why an order did not settle.
 		return true, p.inbox.Ignore(ctx, p.pool.Conn(), event.ID, token,
-			"event type is not a settlement authority", p.now().UTC())
+			"event type changes no local state", p.now().UTC())
 	}
 
-	if err := p.project(ctx, event); err != nil {
+	if err := p.project(ctx, event, via); err != nil {
 		// Failure returns the event for another attempt. The cause is stored
 		// on the row, so a human reading the inbox sees why.
 		if failErr := p.inbox.Fail(ctx, p.pool.Conn(), event.ID, token, err.Error()); failErr != nil {
@@ -117,19 +145,26 @@ func (p *Projector) ProcessOne(ctx context.Context, leaseFor time.Duration) (boo
 }
 
 // project does the work for one event: retrieve canonical state, check the
-// ordering guard, then write.
-func (p *Projector) project(ctx context.Context, event inbox.Event) error {
+// ordering guard, then write. Which local state it resolves to is the route's
+// business.
+func (p *Projector) project(ctx context.Context, event inbox.Event, via route) error {
+	if via == viaSubscription {
+		return p.projectSubscription(ctx, event)
+	}
+
 	sessionID, err := p.sessionIDFor(event)
 	if err != nil {
 		return err
 	}
 	if sessionID == "" {
-		// Nothing local to tie this to. Recorded so the guard has a trace,
-		// but nothing is projected.
+		// A session event with no session id: malformed, or Stripe changed the
+		// payload shape. Recorded so the guard has a trace, but nothing is
+		// projected. This is no longer the routine case it once was — the
+		// subscription events that used to land here now have their own route.
 		_, err := p.billing.RecordApplication(ctx, p.pool.Conn(), billing.Application{
 			Environment: p.env, Account: event.Account,
 			StripeEvent: event.StripeID, EventType: event.Type,
-			Signal: "no local order reference", ObjectID: event.ObjectID,
+			Signal: "no session reference on a session event", ObjectID: event.ObjectID,
 			ObservedAt: p.now().UTC(), Canonical: []byte("{}"),
 		})
 		return err
@@ -313,6 +348,137 @@ func (p *Projector) write(ctx context.Context, c db.Conn, order orders.Order, se
 		}
 	}
 	return nil
+}
+
+// projectSubscription applies the recurring lifecycle: a renewal advances the
+// membership's period, a cancellation revokes it, a status change records it.
+//
+// This is the half of M6 that was missing. A renewal arrives as invoice.paid and
+// there is NO Checkout Session event alongside it — the session existed once, at
+// signup, months ago. So a resolver that only understood sessions meant a member
+// who kept paying silently lost access at the end of their first period, and a
+// member who cancelled kept it forever.
+//
+// Like the session path it trusts nothing in the payload beyond the identifier:
+// the canonical subscription read is what decides status and period end. An
+// invoice event says "something happened to this subscription"; Stripe's current
+// view of the subscription says what.
+func (p *Projector) projectSubscription(ctx context.Context, event inbox.Event) error {
+	subscriptionID, err := p.subscriptionIDFor(event)
+	if err != nil {
+		return err
+	}
+	if subscriptionID == "" {
+		// An invoice with no subscription is a one-off invoice, which this
+		// portal does not issue. Recorded and left alone.
+		_, err := p.billing.RecordApplication(ctx, p.pool.Conn(), billing.Application{
+			Environment: p.env, Account: event.Account,
+			StripeEvent: event.StripeID, EventType: event.Type,
+			Signal: "no subscription reference", ObjectID: event.ObjectID,
+			ObservedAt: p.now().UTC(), Canonical: []byte("{}"),
+		})
+		return err
+	}
+
+	subscription, err := p.pay.GetCanonicalSubscription(ctx, event.Account, subscriptionID)
+	if err != nil {
+		return err
+	}
+
+	newer, err := p.billing.HasNewerObservation(ctx, p.pool.Conn(), p.env, event.Account,
+		subscription.ID, subscription.RetrievedAt)
+	if err != nil {
+		return err
+	}
+	if newer {
+		_, err := p.billing.RecordApplication(ctx, p.pool.Conn(), billing.Application{
+			Environment: p.env, Account: event.Account,
+			StripeEvent: event.StripeID, EventType: event.Type,
+			Signal: "superseded by a newer observation", ObjectID: subscription.ID,
+			ObservedAt: subscription.RetrievedAt, Canonical: []byte("{}"),
+		})
+		return err
+	}
+
+	canonical, _ := json.Marshal(subscription)
+	var periodEnd *time.Time
+	if !subscription.CurrentPeriodEnd.IsZero() {
+		end := subscription.CurrentPeriodEnd
+		periodEnd = &end
+	}
+
+	return p.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
+		applied, err := p.billing.UpdateMembershipLifecycle(ctx, c, p.env, event.Account,
+			subscription.ID, subscription.Status, periodEnd, subscription.CancelAtPeriodEnd)
+		if err != nil {
+			return err
+		}
+
+		signal := "membership " + subscription.Status
+		if subscription.CancelAtPeriodEnd {
+			signal += "; cancels at period end"
+		}
+		if !applied {
+			// No membership for this subscription. Which of two situations this
+			// is decides whether anybody needs to be woken up.
+			known, err := p.orders.SubscriptionIsKnown(ctx, c, p.env, event.Account, subscription.ID)
+			if err != nil {
+				return err
+			}
+			if known {
+				// An order settled against this subscription and produced no
+				// membership. Money moved and nothing was granted, which is the
+				// one failure mode this whole milestone exists to prevent.
+				signal = "subscription settled with no membership; escalated"
+				if err := p.billing.RaiseAlert(ctx, c, p.env, event.Account,
+					"subscription_without_membership", "subscription:"+subscription.ID,
+					"A paid subscription has no local membership",
+					fmt.Sprintf("Stripe subscription %s is %s and an order is settled "+
+						"against it, but no membership row exists. The member is paying "+
+						"for access they do not have.", subscription.ID, subscription.Status),
+					p.now().UTC()); err != nil {
+					return err
+				}
+			} else {
+				// The ordinary race: Stripe sends the first invoice and the
+				// checkout session together, and this one arrived first. Nothing
+				// is lost by skipping it, because settlement reads canonical
+				// subscription state and will record this same period end.
+				signal = "no membership yet; initial settlement not processed"
+			}
+		}
+
+		_, err = p.billing.RecordApplication(ctx, c, billing.Application{
+			Environment: p.env, Account: event.Account,
+			StripeEvent: event.StripeID, EventType: event.Type,
+			Signal: signal, ObjectID: subscription.ID,
+			ObservedAt: subscription.RetrievedAt, Canonical: canonical,
+		})
+		return err
+	})
+}
+
+// subscriptionIDFor finds the subscription an event concerns: its own id for a
+// subscription event, the referenced one for an invoice.
+func (p *Projector) subscriptionIDFor(event inbox.Event) (string, error) {
+	if strings.HasPrefix(event.Type, "customer.subscription.") {
+		return event.ObjectID, nil
+	}
+	object, err := event.ObjectFromPayload()
+	if err != nil {
+		return "", err
+	}
+	// Stripe renders the reference either as a bare id or, when expanded, as an
+	// object. Both spellings appear in the wild depending on API version and
+	// expansion, so read both rather than assuming.
+	switch ref := object["subscription"].(type) {
+	case string:
+		return ref, nil
+	case map[string]any:
+		id, _ := ref["id"].(string)
+		return id, nil
+	}
+	return "", nil
 }
 
 // sessionIDFor finds the Checkout Session an event concerns. Subscription and
