@@ -53,7 +53,6 @@ var layers = map[string]int{
 	"internal/cryptox": 0, // AES-256-GCM keyring + record/field-bound PII AAD
 	"internal/httpx":   0, // middleware, security headers, XFF, rate limiting
 	"internal/csrf":    0, // HMAC token, constant-time compare
-	"internal/cookie":  0, // the only Set-Cookie writer; exposes no Path field
 	"internal/tokens":  0, // opaque 32-byte token + SHA-256 digest
 	"internal/money":   0, // exact cents parsing; no float ever
 	"internal/redact":  0, // sensitive text as a type, not a string
@@ -62,6 +61,11 @@ var layers = map[string]int{
 	// L10 — the shared value vocabulary and the price allowlist.
 	"internal/core":    10,
 	"internal/catalog": 10, // imports core only; never the Stripe client
+
+	// L15 — the only Set-Cookie writer. Not a leaf, because refusing to serve
+	// non-Secure cookies in production requires knowing the environment, and
+	// that check belongs next to the code it protects.
+	"internal/cookie": 15,
 
 	// L20 — outbound seams.
 	"internal/stripepay": 20, // stripe-go wrapper; AccountRef-first API
