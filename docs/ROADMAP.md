@@ -156,6 +156,12 @@ a step the launch sentence silently depends on.
 Compose plus Caddy, `rotate-pii`, the retention sweeper, subject-access export,
 a lean `doctor`, and about 400 lines of documentation replacing 7,583.
 
+Production domains, decided by the owner: the portal is
+**`donate.triplebit.org`** (`PORTAL_BASE_URL`) and Pocket ID is
+**`id.triplebit.org`** (`PORTAL_OIDC_ISSUER`). Sibling subdomains of one
+registrable domain, which is exactly the situation the `__Host-` cookie
+prefix defends: neither host can plant cookies on the other.
+
 Proposed additional gate, pending owner sign-off: **restore, not just backup.**
 The database is the sole source of truth for access and holds field-encrypted
 PII whose keys live in the process environment of one VPS; a restore without

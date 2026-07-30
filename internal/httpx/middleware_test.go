@@ -11,11 +11,11 @@ import (
 )
 
 func TestRequireSameOrigin(t *testing.T) {
-	handler := RequireSameOrigin("https://members.triplebit.org", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	handler := RequireSameOrigin("https://donate.triplebit.org", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	request := httptest.NewRequest(http.MethodPost, "https://members.triplebit.org/action", nil)
+	request := httptest.NewRequest(http.MethodPost, "https://donate.triplebit.org/action", nil)
 	request.Header.Set("Origin", "https://evil.example")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
