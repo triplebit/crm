@@ -24,6 +24,15 @@ import (
 // attacker probing for valid tokens.
 var ErrNoSession = errors.New("auth: no valid session")
 
+// ErrSessionUnreadable means the session row exists but its envelope cannot be
+// opened with the current ring — a dropped rotation key or a corrupt envelope.
+// Unlike a database outage this is permanent for the cookie in question: no
+// retry will ever open it, so the caller's correct move is to discard the
+// cookie, log the fault loudly, and let the member sign in again. Treating it
+// as a plain error instead would lock the member out of every page — including
+// the login page — with no in-app way to recover.
+var ErrSessionUnreadable = errors.New("auth: session envelope cannot be opened")
+
 // Principal is who is making a request, plus the CSRF secret for their session.
 type Principal struct {
 	User  accounts.User
@@ -167,15 +176,17 @@ func (s *Sessions) Load(ctx context.Context, raw string) (Principal, error) {
 	// The envelope comes from our own database row, never from the client, so
 	// the probing-resistance argument for one opaque error does not apply to
 	// this path. An unknown key ID means a previous key was dropped from the
-	// ring too early during rotation — an operational fault that would
-	// otherwise present as every affected member being silently signed out,
-	// which is the same downgrade the database-failure branch above refuses.
-	// It fails loud instead. A failed authentication tag stays ErrNoSession:
-	// that is row tampering, and telling a tamperer more helps only them.
+	// ring too early during rotation; a malformed envelope means the row was
+	// corrupted. Both are operational faults, permanent for this cookie, and
+	// both surface as ErrSessionUnreadable so the web layer can clear the
+	// cookie and log loudly rather than either signing the member out in
+	// silence or locking them out with a 500 on every page. A failed
+	// authentication tag stays ErrNoSession: that is row tampering, and
+	// telling a tamperer more helps only them.
 	secret, err := s.keys.Decrypt(p.Session.CSRFCiphertext, sessionAAD(digest))
 	if err != nil {
-		if errors.Is(err, cryptox.ErrUnknownKey) {
-			return Principal{}, fmt.Errorf("auth: unseal session: %w", err)
+		if errors.Is(err, cryptox.ErrUnknownKey) || errors.Is(err, cryptox.ErrMalformedCiphertext) {
+			return Principal{}, fmt.Errorf("%w: %w", ErrSessionUnreadable, err)
 		}
 		return Principal{}, ErrNoSession
 	}

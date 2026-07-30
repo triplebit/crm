@@ -19,6 +19,7 @@ import (
 
 	"triplebit.org/portal/internal/auth"
 	"triplebit.org/portal/internal/repo/accounts"
+	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/testdb"
 )
 
@@ -286,5 +287,37 @@ func TestSignInCreatesUserAndSession(t *testing.T) {
 	}
 	if !strings.EqualFold(principal.User.Email, sub+"@example.test") {
 		t.Errorf("principal email = %q", principal.User.Email)
+	}
+}
+
+// A second Pocket ID subject asserting an email that already belongs to
+// someone else trips the schema's one-account-per-email index. That must
+// surface as a safe, human-readable refusal — not an opaque 500 on every
+// attempt — and case-only variants must collide too, because the index is on
+// lower(email).
+func TestSignInWithAnotherAccountsEmailFailsSafely(t *testing.T) {
+	ctx := context.Background()
+	sessions, _, _ := newSessions(t)
+	pool := testdb.Pool(t)
+
+	email := fmt.Sprintf("shared-%d@example.test", time.Now().UnixNano())
+	first, _, err := sessions.SignIn(ctx, auth.Identity{
+		Subject: "subject-a-" + email, Email: email, EmailVerified: true,
+	})
+	if err != nil {
+		t.Fatalf("first SignIn: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Conn().Exec(context.Background(), `DELETE FROM users WHERE id = $1`, first.ID)
+	})
+
+	_, _, err = sessions.SignIn(ctx, auth.Identity{
+		Subject: "subject-b-" + email, Email: strings.ToUpper(email), EmailVerified: true,
+	})
+	if err == nil {
+		t.Fatal("a second subject claimed an existing email and was accepted")
+	}
+	if !safeerr.IsSafe(err) {
+		t.Errorf("the collision error %v is not safe to render; the member would see a blank 500 forever", err)
 	}
 }

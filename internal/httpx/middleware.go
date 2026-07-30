@@ -32,7 +32,14 @@ func (m Middleware) Wrap(next http.Handler) http.Handler {
 	if m.Logger == nil {
 		m.Logger = slog.Default()
 	}
-	return m.recoverPanic(m.securityHeaders(m.requestLog(m.requestID(next))))
+	// requestID is outermost because it publishes the ID via the request
+	// context, and a context flows inward only: anything outside the
+	// middleware that sets it reads an empty value. This ordering was once
+	// inverted, and every access log and panic log carried request_id=""
+	// while the comments promised otherwise — the test below the middleware
+	// asserts the logged ID equals the response header so it cannot silently
+	// regress.
+	return m.requestID(m.recoverPanic(m.securityHeaders(m.requestLog(next))))
 }
 
 // requestIDPattern is what an inbound X-Request-ID must match to be reused.

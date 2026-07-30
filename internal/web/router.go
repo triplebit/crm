@@ -83,6 +83,19 @@ func (s *Server) post(pattern string, h handler) {
 }
 
 func (s *Server) register(rt route, h handler) {
+	// Impossible combinations are refused at startup, not discovered at
+	// request time: CSRF validation reads the session's secret, so without a
+	// session requirement it is a nil dereference waiting for its first
+	// request; and a CSRF flag on a method csrf.Required exempts would claim
+	// protection while validating nothing — the registry tests would count it
+	// as covered, which is worse than not registering it at all.
+	if rt.ValidatesCSRF && !rt.RequiresSession {
+		panic(fmt.Sprintf("web: route %s %s validates CSRF without requiring a session", rt.Method, rt.Pattern))
+	}
+	if rt.ValidatesCSRF && !csrf.Required(rt.Method) {
+		panic(fmt.Sprintf("web: route %s %s claims CSRF validation on a method the check exempts", rt.Method, rt.Pattern))
+	}
+
 	s.routes = append(s.routes, rt)
 	s.mux.HandleFunc(rt.Method+" "+rt.Pattern, func(w http.ResponseWriter, r *http.Request) {
 		c := &reqctx{w: w, r: r, s: s}
@@ -104,6 +117,18 @@ func (s *Server) register(rt route, h handler) {
 			case errors.Is(err, auth.ErrNoSession):
 				// Anonymous: an absent, expired or revoked session is the
 				// ordinary signed-out state, not an error.
+			case errors.Is(err, auth.ErrSessionUnreadable):
+				// The envelope can never be opened again — a dropped rotation
+				// key or a corrupt row. Failing the request would lock the
+				// member out of every page including /login; staying silent
+				// would hide a rotation done wrong. So: loud log, dead cookie
+				// cleared, request served anonymous, and the member's next
+				// sign-in issues a session under the active key.
+				s.logger.ErrorContext(r.Context(), "session envelope unreadable; clearing cookie",
+					slog.String("request_id", httpx.RequestID(r.Context())),
+					slog.String("error", err.Error()),
+				)
+				s.jar.Clear(w, s.sessionCookie)
 			default:
 				// A database failure must not downgrade the request to
 				// anonymous — that would present an outage as "signed out"
@@ -145,15 +170,21 @@ func (s *Server) register(rt route, h handler) {
 }
 
 // fail renders an error without disclosing it. The full chain goes to the log;
-// the browser sees a safe sentence and a request ID to quote.
+// the browser sees a safe sentence and a request ID to quote, which is the
+// same ID the log line carries — that correspondence is what makes a member's
+// support message findable.
 func (s *Server) fail(c *reqctx, err error) {
+	requestID := httpx.RequestID(c.r.Context())
 	s.logger.ErrorContext(c.r.Context(), "request failed",
-		slog.String("request_id", httpx.RequestID(c.r.Context())),
+		slog.String("request_id", requestID),
 		slog.String("method", c.r.Method),
 		slog.String("path", c.r.URL.Path),
 		slog.String("error", err.Error()),
 	)
 	message := safeerr.Message(err, "Something went wrong. Please try again.")
+	if requestID != "" {
+		message += " (request " + requestID + ")"
+	}
 	http.Error(c.w, message, http.StatusInternalServerError)
 }
 

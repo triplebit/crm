@@ -13,6 +13,7 @@ import (
 
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/repo/accounts"
+	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/tokens"
 )
 
@@ -243,6 +244,22 @@ func (s *Sessions) SignIn(ctx context.Context, id Identity) (accounts.User, toke
 		Now:           s.now().UTC(),
 	})
 	if err != nil {
+		// The upsert is keyed on the Pocket ID subject, but the schema also
+		// enforces one account per lower(email). A new subject asserting an
+		// email that already belongs to a different subject — a reassigned
+		// address, a second IdP account, a case-only variant — trips that
+		// index, and without this branch it would render as an opaque 500 on
+		// every sign-in attempt, forever. The member gets a sentence a human
+		// can act on instead.
+		//
+		// ponytail: whether identity is "one person per subject" (drop the
+		// email index) or "one person per email" (link accounts by verified
+		// email) is an open product decision; until it is made, this surfaces
+		// the collision instead of resolving it.
+		if db.ConstraintOf(err) == "users_email_normalized_idx" {
+			return accounts.User{}, tokens.Token{}, safeerr.New(
+				"This email address already belongs to a different account. Please contact support.")
+		}
 		return accounts.User{}, tokens.Token{}, err
 	}
 	token, err := s.Issue(ctx, user.ID, id.LoginMethod)

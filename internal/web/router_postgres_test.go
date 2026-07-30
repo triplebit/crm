@@ -105,9 +105,9 @@ func (s *Server) do(t *testing.T, method, path, sessionToken, body string) *http
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	if sessionToken != "" {
-		// A raw Cookie header rather than http.Cookie: lint-cookie forbids
-		// constructing cookies outside internal/cookie, and a request cookie
-		// is just a header — the single-writer rule is about Set-Cookie.
+		// A raw Cookie header rather than the stdlib cookie type: the lint
+		// forbids constructing cookies outside internal/cookie, and a request
+		// cookie is just a header — the single-writer rule concerns responses.
 		r.Header.Set("Cookie", s.sessionCookie.String()+"="+sessionToken)
 	}
 	w := httptest.NewRecorder()
@@ -253,4 +253,71 @@ func TestSignInEndpointsAreRateLimited(t *testing.T) {
 	if w := s.do(t, http.MethodGet, "/auth/callback", token, ""); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("second callback: status %d, want 429", w.Code)
 	}
+}
+
+// A session sealed under a key the ring no longer holds must not lock the
+// member out (500 on every page, /login included) and must not pass silently:
+// the router clears the dead cookie and serves the request anonymous, so the
+// member's next click signs them back in under the active key.
+func TestUnreadableSessionEnvelopeClearsCookieAndServesAnonymous(t *testing.T) {
+	s, token := newTestServer(t)
+
+	// The same rows, read through a ring that cannot open the envelope.
+	otherKey := make([]byte, 32)
+	for i := range otherKey {
+		otherKey[i] = byte(i + 7)
+	}
+	rotated, err := cryptox.NewKeyring("web-rotated", map[string][]byte{"web-rotated": otherKey})
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	rotatedSessions, err := auth.NewSessions(auth.SessionOptions{
+		Repo: accounts.New(), Pool: testdb.Pool(t), Keys: rotated,
+		IdleTTL: 30 * time.Minute, AbsoluteTTL: 12 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewSessions: %v", err)
+	}
+	s.sessions = rotatedSessions
+
+	w := s.do(t, http.MethodGet, "/", token, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("home with an unreadable session: status %d, want 200 anonymous", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "/login") {
+		t.Error("the page did not render the anonymous state")
+	}
+	cleared := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == s.sessionCookie.String() && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("the dead session cookie was not cleared; the member would carry it forever")
+	}
+}
+
+// The two route combinations that would be silently broken at request time —
+// CSRF without a session (nil-deref on the secret) and CSRF on an exempt
+// method (claims protection, validates nothing) — must refuse to register.
+func TestImpossibleRouteCombinationsRefuseToRegister(t *testing.T) {
+	t.Parallel()
+	expectPanic := func(name string, rt route) {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("route %+v registered without panicking", rt)
+				}
+			}()
+			s := &Server{mux: http.NewServeMux()}
+			s.register(rt, func(*reqctx) error { return nil })
+		})
+	}
+	expectPanic("csrf without session", route{
+		Method: http.MethodPost, Pattern: "/broken", ValidatesCSRF: true,
+	})
+	expectPanic("csrf on exempt method", route{
+		Method: http.MethodGet, Pattern: "/broken", RequiresSession: true, ValidatesCSRF: true,
+	})
 }

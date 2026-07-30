@@ -1,8 +1,12 @@
 package httpx
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -312,5 +316,56 @@ func TestLoggingMiddlewareDoesNotSwallowFlusher(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if !response.Flushed {
 		t.Fatal("Flush never reached the underlying writer")
+	}
+}
+
+// The request ID must actually reach the logs — requestID publishes it via the
+// request context, so it must be the outermost middleware. This was once
+// inverted: every access log and panic log carried request_id="" while the
+// comments promised otherwise, and no test noticed.
+func TestAccessAndPanicLogsCarryTheRealRequestID(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	requestID := func(line string) string {
+		var entry struct {
+			RequestID string `json:"request_id"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("parse log line %q: %v", line, err)
+		}
+		return entry.RequestID
+	}
+
+	handler := (Middleware{Logger: logger}).Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	header := response.Header().Get("X-Request-ID")
+	if header == "" {
+		t.Fatal("no X-Request-ID header was set")
+	}
+	logged := requestID(strings.TrimSpace(buf.String()))
+	if logged != header {
+		t.Errorf("access log request_id = %q, response header = %q; they must match", logged, header)
+	}
+
+	// The panic log is emitted by a different middleware and must see the
+	// same value.
+	buf.Reset()
+	handler = (Middleware{Logger: logger}).Wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	}))
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	header = response.Header().Get("X-Request-ID")
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if got := requestID(line); got != header {
+			t.Errorf("log line request_id = %q, response header = %q; they must match", got, header)
+		}
 	}
 }

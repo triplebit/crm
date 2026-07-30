@@ -321,6 +321,9 @@ func TestSessionSealedUnderADroppedKeyFailsLoud(t *testing.T) {
 	if errors.Is(err, auth.ErrNoSession) {
 		t.Fatal("a dropped rotation key read as ErrNoSession; an operational fault must not present as a sign-out")
 	}
+	if !errors.Is(err, auth.ErrSessionUnreadable) {
+		t.Errorf("error %v is not ErrSessionUnreadable; the web layer needs that sentinel to clear the cookie instead of failing every page", err)
+	}
 	if !errors.Is(err, cryptox.ErrUnknownKey) {
 		t.Errorf("error %v does not wrap cryptox.ErrUnknownKey", err)
 	}

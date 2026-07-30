@@ -1,0 +1,15 @@
+# Docker does not read .gitignore. Without this file, a local .env full of
+# real keys — and the entire OLD/ tree — enters the build context and the
+# build-stage layer cache. The published image only copies /portal forward,
+# but "only the cache leaks" is not a sentence this repository says.
+.env
+.env.*
+!.env.example
+.git/
+.github/
+.agentsroom/
+OLD/
+bin/
+docs/
+compose.yaml
+Makefile
