@@ -1,7 +1,6 @@
 // Package accounts is the repository for who someone is and what they may do:
-// users, their staff roles, and their browser sessions.
-//
-//portal:tables users staff_roles browser_sessions
+// users, their staff roles, their browser sessions, and the in-flight login
+// transactions that become sessions.
 package accounts
 
 import (

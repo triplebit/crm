@@ -137,8 +137,8 @@ func (c *Config) RequireServe() error {
 	l := &loader{}
 	l.require(c.DatabaseURL != "", "PORTAL_DATABASE_URL is required")
 	l.require(c.BaseURL != nil, "PORTAL_BASE_URL is required")
-	l.requireKeyring(&l.problems, "PORTAL_ENCRYPTION", c.PII)
-	l.requireKeyring(&l.problems, "PORTAL_SESSION", c.Session)
+	l.requireKeyring("PORTAL_ENCRYPTION", c.PII)
+	l.requireKeyring("PORTAL_SESSION", c.Session)
 	l.require(c.OIDC.Issuer != "", "PORTAL_OIDC_ISSUER is required")
 	l.require(c.OIDC.ClientID != "", "PORTAL_OIDC_CLIENT_ID is required")
 	l.require(c.OIDC.ClientSecret != "", "PORTAL_OIDC_CLIENT_SECRET is required")
@@ -277,27 +277,28 @@ func (l *loader) keyring(prefix string) Keyring {
 	return ring
 }
 
-func (l *loader) requireKeyring(problems *[]string, prefix string, ring Keyring) {
-	if ring.ActiveID == "" {
-		*problems = append(*problems, prefix+"_KEY_ID is required")
-	}
-	if len(ring.Active) == 0 {
-		*problems = append(*problems, prefix+"_KEY is required")
-	}
-	if _, clash := ring.Previous[ring.ActiveID]; clash && ring.ActiveID != "" {
-		*problems = append(*problems,
-			prefix+"_PREVIOUS_KEYS must not contain the active key id")
-	}
+func (l *loader) requireKeyring(prefix string, ring Keyring) {
+	l.require(ring.ActiveID != "", prefix+"_KEY_ID is required")
+	l.require(len(ring.Active) > 0, prefix+"_KEY is required")
+	_, clash := ring.Previous[ring.ActiveID]
+	l.require(!(clash && ring.ActiveID != ""),
+		prefix+"_PREVIOUS_KEYS must not contain the active key id")
 }
 
 // checkUniversal holds the cross-field rules that apply to every subcommand.
 func (l *loader) checkUniversal(cfg *Config) {
-	// The two rings must be genuinely independent. Sharing key material would
-	// mean that recovering the session key also decrypts stored personal data.
-	if len(cfg.PII.Active) > 0 && len(cfg.Session.Active) > 0 {
-		if string(cfg.PII.Active) == string(cfg.Session.Active) {
-			l.problems = append(l.problems,
-				"PORTAL_ENCRYPTION_KEY and PORTAL_SESSION_KEY must be different keys")
+	// The two rings must be genuinely independent: no key material may appear
+	// in both, in any position. Comparing only the active keys would let a
+	// rotation quietly move the PII key into the session ring's previous list
+	// (or vice versa), after which recovering one ring decrypts the other's
+	// data — precisely what having two rings is meant to prevent.
+	for piiID, piiKey := range allKeys(cfg.PII) {
+		for sessionID, sessionKey := range allKeys(cfg.Session) {
+			if string(piiKey) == string(sessionKey) {
+				l.problems = append(l.problems, fmt.Sprintf(
+					"PORTAL_ENCRYPTION key %q and PORTAL_SESSION key %q are the same key material; the rings must be independent",
+					piiID, sessionID))
+			}
 		}
 	}
 	if cfg.PII.ActiveID != "" && cfg.PII.ActiveID == cfg.Session.ActiveID {
@@ -376,6 +377,18 @@ func decodeKey(raw string) ([]byte, error) {
 		return nil, errors.New("must not be all zero bytes")
 	}
 	return key, nil
+}
+
+// allKeys flattens a ring into id → key material, active included.
+func allKeys(ring Keyring) map[string][]byte {
+	keys := make(map[string][]byte, len(ring.Previous)+1)
+	for id, key := range ring.Previous {
+		keys[id] = key
+	}
+	if len(ring.Active) > 0 {
+		keys[ring.ActiveID] = ring.Active
+	}
+	return keys
 }
 
 func isAllZero(key []byte) bool {

@@ -36,8 +36,6 @@ type Principal struct {
 	// CSRFSecret is the decrypted per-session secret. It never leaves the
 	// server and is never rendered; the derived token is what reaches a page.
 	CSRFSecret []byte
-
-	sessionDigest []byte
 }
 
 // HasRole reports whether the principal currently holds a staff role.
@@ -165,17 +163,28 @@ func (s *Sessions) Load(ctx context.Context, raw string) (Principal, error) {
 	// tamper protection; the previous implementation added a second, redundant
 	// check comparing duplicated timestamps, and it was the redundant one that
 	// broke every login.
+	//
+	// The envelope comes from our own database row, never from the client, so
+	// the probing-resistance argument for one opaque error does not apply to
+	// this path. An unknown key ID means a previous key was dropped from the
+	// ring too early during rotation — an operational fault that would
+	// otherwise present as every affected member being silently signed out,
+	// which is the same downgrade the database-failure branch above refuses.
+	// It fails loud instead. A failed authentication tag stays ErrNoSession:
+	// that is row tampering, and telling a tamperer more helps only them.
 	secret, err := s.keys.Decrypt(p.Session.CSRFCiphertext, sessionAAD(digest))
 	if err != nil {
+		if errors.Is(err, cryptox.ErrUnknownKey) {
+			return Principal{}, fmt.Errorf("auth: unseal session: %w", err)
+		}
 		return Principal{}, ErrNoSession
 	}
 
 	return Principal{
-		User:          p.User,
-		Roles:         p.Roles,
-		LoginMethod:   p.Session.LoginMethod,
-		CSRFSecret:    secret,
-		sessionDigest: digest,
+		User:        p.User,
+		Roles:       p.Roles,
+		LoginMethod: p.Session.LoginMethod,
+		CSRFSecret:  secret,
 	}, nil
 }
 

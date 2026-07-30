@@ -281,3 +281,47 @@ func TestIncompleteConfigurationIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// A session sealed under a key that has since been dropped from the ring is an
+// operational fault — a rotation done wrong — not a sign-out. It must surface
+// loudly, because the ErrNoSession alternative silently signs out every member
+// whose session was sealed under the dropped key, and nothing anywhere would
+// say why.
+func TestSessionSealedUnderADroppedKeyFailsLoud(t *testing.T) {
+	ctx := context.Background()
+	sessions, repo, userID := newSessions(t)
+
+	token, err := sessions.Issue(ctx, userID, "passkey")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	// The same database rows, read through a ring that no longer holds the
+	// sealing key. This is exactly what a premature rotation produces.
+	otherKey := make([]byte, 32)
+	for i := range otherKey {
+		otherKey[i] = byte(200 - i)
+	}
+	rotated, err := cryptox.NewKeyring("session-v2", map[string][]byte{"session-v2": otherKey})
+	if err != nil {
+		t.Fatalf("keyring: %v", err)
+	}
+	rotatedSessions, err := auth.NewSessions(auth.SessionOptions{
+		Repo: repo, Pool: testdb.Pool(t), Keys: rotated,
+		IdleTTL: 30 * time.Minute, AbsoluteTTL: 12 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewSessions: %v", err)
+	}
+
+	_, err = rotatedSessions.Load(ctx, token.String())
+	if err == nil {
+		t.Fatal("a session sealed under a missing key loaded successfully")
+	}
+	if errors.Is(err, auth.ErrNoSession) {
+		t.Fatal("a dropped rotation key read as ErrNoSession; an operational fault must not present as a sign-out")
+	}
+	if !errors.Is(err, cryptox.ErrUnknownKey) {
+		t.Errorf("error %v does not wrap cryptox.ErrUnknownKey", err)
+	}
+}

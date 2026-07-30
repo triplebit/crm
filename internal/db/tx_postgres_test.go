@@ -122,10 +122,18 @@ func TestSerializationFailureIsSurfacedWithoutRetries(t *testing.T) {
 }
 
 // The same conflict, with a retry budget, must resolve invisibly.
+//
+// The budget here is deliberately generous. Retries with millisecond jitter
+// windows can re-cross the still-running peer transaction, and each unlucky
+// crossing burns one retry; with Retries=3 that lost a CI run on a loaded
+// two-core runner (2026-07-30, run 30518457344) while 600 local iterations
+// never reproduced it. The property under test is "a retry budget makes the
+// conflict invisible", not "three is always enough", so the test asserts the
+// former with room for scheduler malice.
 func TestSerializationFailureIsRetriedTransparently(t *testing.T) {
 	pool := testdb.Pool(t)
 
-	errs := runCrossingPair(t, pool, db.TxOptions{Serializable: true, Retries: 3})
+	errs := runCrossingPair(t, pool, db.TxOptions{Serializable: true, Retries: 10})
 
 	for i, err := range errs {
 		if err != nil {

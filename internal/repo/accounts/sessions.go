@@ -151,8 +151,10 @@ func (r *Repo) Revoke(ctx context.Context, q db.Conn, tokenDigest []byte, reason
 //
 // This is the force-logout path. The previous implementation had an equivalent
 // function with no callers anywhere, which meant that in practice there was no
-// way to sign someone out of every browser after a security event. Here it is
-// called by sign-out, by staff-role revocation, and by erasure.
+// way to sign someone out of every browser after a security event. Staff-role
+// revocation (M7) and erasure (M8) must call this when they arrive; until they
+// do, its callers are its tests, and this comment is the reminder that a
+// security control without a caller is the exact failure being rebuilt away.
 func (r *Repo) RevokeUser(ctx context.Context, q db.Conn, userID uuid.UUID, reason string, now time.Time) (int64, error) {
 	tag, err := q.Exec(ctx, `
 		UPDATE browser_sessions

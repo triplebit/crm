@@ -183,6 +183,26 @@ func TestTheTwoKeyRingsMustNotShareMaterial(t *testing.T) {
 	}); err == nil {
 		t.Error("the same key id was accepted for both rings")
 	}
+
+	// Independence must hold across previous keys too, in both directions:
+	// a rotation that moves one ring's key into the other ring's history is
+	// the same compromise with a delay on it.
+	if _, err := loadServe(t, map[string]string{
+		"PORTAL_SESSION_PREVIOUS_KEYS": "session-v0=" + key(1), // the PII active key
+	}); err == nil {
+		t.Error("the PII active key was accepted as a previous session key")
+	}
+	if _, err := loadServe(t, map[string]string{
+		"PORTAL_ENCRYPTION_PREVIOUS_KEYS": "pii-v0=" + key(2), // the session active key
+	}); err == nil {
+		t.Error("the session active key was accepted as a previous PII key")
+	}
+	if _, err := loadServe(t, map[string]string{
+		"PORTAL_ENCRYPTION_PREVIOUS_KEYS": "pii-v0=" + key(9),
+		"PORTAL_SESSION_PREVIOUS_KEYS":    "session-v0=" + key(9),
+	}); err == nil {
+		t.Error("the same key was accepted in both rings' previous lists")
+	}
 }
 
 func TestProductionRequiresHTTPS(t *testing.T) {
