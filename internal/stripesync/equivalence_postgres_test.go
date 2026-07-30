@@ -31,10 +31,16 @@ func mismatchAlert(t *testing.T, f *settlementFixture) (count int, message strin
 	return count, message
 }
 
+// cleanupAlerts removes the alerts a test raised. The error is reported rather
+// than discarded: a silently failing cleanup DELETE is how this project leaked
+// rows into the shared database for weeks before anybody counted them.
 func cleanupAlerts(t *testing.T, f *settlementFixture) {
 	t.Cleanup(func() {
-		_, _ = f.pool.Conn().Exec(context.Background(),
-			`DELETE FROM staff_alerts WHERE source_key = $1`, "order:"+f.orderID.String())
+		if _, err := f.pool.Conn().Exec(context.Background(),
+			`DELETE FROM staff_alerts WHERE source_key = $1`,
+			"order:"+f.orderID.String()); err != nil {
+			t.Errorf("cleanup alerts for order %s: %v", f.orderID, err)
+		}
 	})
 }
 

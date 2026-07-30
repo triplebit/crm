@@ -3,8 +3,11 @@ package stripesync_test
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/core"
@@ -211,4 +214,63 @@ func staleSweeper(t *testing.T, f *settlementFixture, ahead time.Duration) strip
 		t.Fatalf("NewAbandoner: %v", err)
 	}
 	return sweeper
+}
+
+// A permanently failing event must not burn its attempt budget in a tight loop.
+//
+// This is the whole point of the retry schedule, observed where it matters: in
+// the running worker. Before next_attempt_at existed, Fail returned the row to
+// 'failed', Claim took it back on the very next poll, and the worker looped
+// immediately because a failed attempt still counted as work — so a Stripe blip
+// lasting a second consumed all twelve attempts within milliseconds and
+// dead-lettered a legitimate payment.
+//
+// The event here fails for a real reason: it names a Checkout Session the fake
+// has never heard of, so canonical retrieval 404s every time.
+func TestAPermanentlyFailingEventIsNotRetriedInATightLoop(t *testing.T) {
+	f := newSettlement(t, "hotspot")
+	ctx := context.Background()
+
+	unknown := "cs_test_missing_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	event := f.receive(t, "checkout.session.completed", unknown, core.Memberships)
+
+	_, stop := runWorker(t, f, nil)
+
+	// Let the worker poll many times over. With a 5ms idle poll this is on the
+	// order of a hundred passes: ample to exhaust twelve attempts if nothing
+	// paced them.
+	time.Sleep(500 * time.Millisecond)
+	stop()
+
+	var attempts int
+	var state string
+	if err := f.pool.Conn().QueryRow(ctx, `
+		SELECT attempts, processing_state FROM webhook_events WHERE stripe_event_id = $1
+	`, event.StripeID).Scan(&attempts, &state); err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+
+	// One attempt, because the second is not due for ~30 seconds. Two would be
+	// tolerable if a reap intervened; twelve is the bug.
+	if attempts > 2 {
+		t.Errorf("%d attempts in half a second: the retry schedule is not pacing anything", attempts)
+	}
+	if attempts == 0 {
+		t.Error("the event was never attempted, so this test proves nothing")
+	}
+	if state != "failed" {
+		t.Errorf("state = %s, want failed and awaiting its next attempt", state)
+	}
+
+	// And it must not yet be a dead letter: the budget is intact, so a human
+	// should not have been told anything.
+	var due time.Time
+	if err := f.pool.Conn().QueryRow(ctx, `
+		SELECT next_attempt_at FROM webhook_events WHERE stripe_event_id = $1
+	`, event.StripeID).Scan(&due); err != nil {
+		t.Fatalf("read due time: %v", err)
+	}
+	if !due.After(time.Now().Add(10 * time.Second)) {
+		t.Errorf("next attempt is due at %s, which is too soon to have waited for anything", due)
+	}
 }

@@ -195,6 +195,10 @@ func TestExhaustedAttemptsStopRetryingAndSurface(t *testing.T) {
 		t.Fatalf("shrink budget: %v", err)
 	}
 
+	// The clock advances past the backoff between attempts, so this test measures
+	// the attempt BUDGET and nothing else. Retry spacing is a separate property
+	// with its own test; conflating them would make this one fail for two
+	// different reasons and explain neither.
 	for attempt := 1; attempt <= 2; attempt++ {
 		claimed, token, err := repo.Claim(ctx, pool.Conn(), core.StripeSandbox, time.Minute, now)
 		if err != nil {
@@ -202,16 +206,18 @@ func TestExhaustedAttemptsStopRetryingAndSurface(t *testing.T) {
 		}
 		if claimed.ID != event.ID {
 			// Another package's test row; put it back and retry.
-			_ = repo.Fail(ctx, pool.Conn(), claimed.ID, token, "not ours")
+			_ = repo.Fail(ctx, pool.Conn(), claimed.ID, token, "not ours", claimed.Attempts, now)
 			attempt--
 			continue
 		}
-		if err := repo.Fail(ctx, pool.Conn(), claimed.ID, token, fmt.Sprintf("attempt %d failed", attempt)); err != nil {
+		if err := repo.Fail(ctx, pool.Conn(), claimed.ID, token,
+			fmt.Sprintf("attempt %d failed", attempt), claimed.Attempts, now); err != nil {
 			t.Fatalf("fail %d: %v", attempt, err)
 		}
+		now = now.Add(2 * time.Hour) // past the backoff cap
 	}
 
-	// Budget exhausted: it must not be handed out again.
+	// Budget exhausted: it must not be handed out again, however long we wait.
 	for i := 0; i < 5; i++ {
 		claimed, token, err := repo.Claim(ctx, pool.Conn(), core.StripeSandbox, time.Minute, now)
 		if errors.Is(err, db.ErrNotFound) {
@@ -223,7 +229,7 @@ func TestExhaustedAttemptsStopRetryingAndSurface(t *testing.T) {
 		if claimed.ID == event.ID {
 			t.Fatal("an event past its attempt budget was claimed again")
 		}
-		_ = repo.Fail(ctx, pool.Conn(), claimed.ID, token, "not ours")
+		_ = repo.Fail(ctx, pool.Conn(), claimed.ID, token, "not ours", claimed.Attempts, now)
 	}
 
 	// And it must be listed for a human.
@@ -242,5 +248,93 @@ func TestExhaustedAttemptsStopRetryingAndSurface(t *testing.T) {
 	}
 	if !found {
 		t.Error("an exhausted event is not listed as a dead letter; nobody would ever see it")
+	}
+}
+
+// A failed event must not be claimable again until its delay has elapsed, and it
+// must be claimable once it has. This is the property the M6 gate claimed —
+// "a failed job visibly retries with backoff" — and did not have.
+//
+// Everything here is driven by an injected clock rather than by sleeping, so the
+// test measures the schedule instead of the test runner's patience.
+func TestAFailedEventWaitsForItsBackoffBeforeBeingClaimedAgain(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	repo := inbox.New()
+	now := time.Now().UTC()
+
+	event := newEvent(t, pool, "invoice.payment_failed")
+	if _, err := repo.Receive(ctx, pool.Conn(), event, now, now); err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	// claimOurs takes rows until it gets this test's, returning other packages'
+	// rows to the queue untouched — the test database is shared.
+	claimOurs := func(at time.Time) (inbox.Event, uuid.UUID, error) {
+		for range 20 {
+			claimed, token, err := repo.Claim(ctx, pool.Conn(), core.StripeSandbox, time.Minute, at)
+			if err != nil {
+				return inbox.Event{}, uuid.Nil, err
+			}
+			if claimed.ID == event.ID {
+				return claimed, token, nil
+			}
+			_ = repo.Fail(ctx, pool.Conn(), claimed.ID, token, "not ours", claimed.Attempts, at)
+		}
+		t.Fatal("could not reach this test's event among the shared rows")
+		return inbox.Event{}, uuid.Nil, nil
+	}
+
+	// A new event is due immediately: receipt must not itself be delayed.
+	claimed, token, err := claimOurs(now)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if err := repo.Fail(ctx, pool.Conn(), claimed.ID, token, "stripe was down",
+		claimed.Attempts, now); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	// Immediately afterwards there is nothing due. Before the due time existed,
+	// this is exactly where the next attempt was handed out — twelve times in a
+	// few milliseconds, then dead-lettered.
+	if _, _, err := repo.Claim(ctx, pool.Conn(), core.StripeSandbox, time.Minute, now); err == nil {
+		t.Error("a just-failed event was claimable immediately; the outage would burn its whole budget")
+	} else if !errors.Is(err, db.ErrNotFound) {
+		t.Errorf("claim error = %v, want db.ErrNotFound", err)
+	}
+
+	// Still nothing due a moment later: the minimum wait is seconds, not
+	// milliseconds.
+	if _, _, err := repo.Claim(ctx, pool.Conn(), core.StripeSandbox, time.Minute,
+		now.Add(time.Second)); err != nil && !errors.Is(err, db.ErrNotFound) {
+		t.Errorf("claim error = %v, want db.ErrNotFound", err)
+	}
+
+	// Past the maximum first delay (base plus jitter), it comes back.
+	retryAt := now.Add(2 * time.Minute)
+	again, token2, err := claimOurs(retryAt)
+	if err != nil {
+		t.Fatalf("claim after the backoff: %v", err)
+	}
+	if again.Attempts != 2 {
+		t.Errorf("attempts = %d on the second claim, want 2", again.Attempts)
+	}
+
+	// And a second failure waits longer than the first did, which is what makes
+	// the schedule a backoff rather than a fixed delay.
+	if err := repo.Fail(ctx, pool.Conn(), again.ID, token2, "stripe still down",
+		again.Attempts, retryAt); err != nil {
+		t.Fatalf("second fail: %v", err)
+	}
+	var firstDue, secondDue time.Time
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT next_attempt_at FROM webhook_events WHERE id = $1`, event.ID).Scan(&secondDue); err != nil {
+		t.Fatalf("read due time: %v", err)
+	}
+	firstDue = now.Add(inbox.BackoffFor(1))
+	if secondDue.Sub(retryAt) <= firstDue.Sub(now) {
+		t.Errorf("second delay %s is not longer than the first %s",
+			secondDue.Sub(retryAt), firstDue.Sub(now))
 	}
 }

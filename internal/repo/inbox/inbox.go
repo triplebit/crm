@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,11 +65,17 @@ func (e Event) ObjectFromPayload() (map[string]any, error) {
 // rather than a second projection. The boolean says which happened, so the
 // handler can answer 200 either way while the log can tell them apart.
 func (r *Repo) Receive(ctx context.Context, q db.Conn, e Event, receivedAt time.Time, stripeCreatedAt time.Time) (stored bool, err error) {
+	// next_attempt_at is set to receivedAt rather than left to the column's
+	// DEFAULT now(). The default is the DATABASE's clock while Claim compares
+	// against the caller's, and a due-time comparison across two clocks is a
+	// coin toss: a database a second ahead makes every freshly received event
+	// briefly unclaimable. One injected clock decides both, as everywhere else
+	// in this package.
 	tag, err := q.Exec(ctx, `
 		INSERT INTO webhook_events (id, environment, account_ref, stripe_event_id,
 		    event_type, object_id, payload, stripe_created_at, received_at,
-		    processing_state)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+		    next_attempt_at, processing_state)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, 'pending')
 		ON CONFLICT (environment, account_ref, stripe_event_id) DO NOTHING
 	`, e.ID, e.Environment.String(), e.Account.String(), e.StripeID,
 		e.Type, e.ObjectID, e.Payload, stripeCreatedAt, receivedAt)
@@ -96,7 +103,8 @@ func (r *Repo) Claim(ctx context.Context, q db.Conn, env core.StripeEnvironment,
 			WHERE environment = $1
 			  AND processing_state IN ('pending', 'failed')
 			  AND attempts < max_attempts
-			ORDER BY received_at
+			  AND next_attempt_at <= $3
+			ORDER BY next_attempt_at, received_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
@@ -129,34 +137,76 @@ func (r *Repo) Claim(ctx context.Context, q db.Conn, env core.StripeEnvironment,
 // worker whose lease expired and was reaped must not later overwrite the
 // state of a row another worker has since taken.
 func (r *Repo) Complete(ctx context.Context, q db.Conn, id, token uuid.UUID, at time.Time) error {
-	return r.finish(ctx, q, id, token, "processed", "", &at)
+	return r.finish(ctx, q, id, token, "processed", "", &at, nil)
 }
 
 // Ignore marks a claimed event as deliberately not projected — an event type
 // this portal does not act on. Recorded rather than dropped, so "we never saw
 // it" and "we saw it and it does not concern us" stay distinguishable.
 func (r *Repo) Ignore(ctx context.Context, q db.Conn, id, token uuid.UUID, reason string, at time.Time) error {
-	return r.finish(ctx, q, id, token, "ignored", reason, &at)
+	return r.finish(ctx, q, id, token, "ignored", reason, &at, nil)
 }
 
-// Fail releases a claim after a failed attempt. The event returns to 'failed',
-// which the claim query still picks up until attempts reaches max_attempts —
-// at which point it stops being retried and becomes a job for a human, which
-// is what DeadLetters lists.
-func (r *Repo) Fail(ctx context.Context, q db.Conn, id, token uuid.UUID, cause string) error {
-	return r.finish(ctx, q, id, token, "failed", cause, nil)
+// Backoff bounds and shape. Twelve attempts on this schedule span roughly five
+// hours, which sits comfortably inside the three days Stripe keeps retrying
+// deliveries — so an outage long enough to exhaust our attempts is one a human
+// should hear about, and DeadLetters is how they do.
+const (
+	backoffBase = 30 * time.Second
+	backoffCap  = time.Hour
+
+	// jitterFraction spreads retries so a fleet of workers that all failed on the
+	// same Stripe outage do not return in lockstep and reproduce it.
+	jitterFraction = 0.2
+)
+
+// BackoffFor returns how long to wait before the given attempt number may be
+// retried: doubling from backoffBase, capped at backoffCap, plus or minus
+// jitterFraction.
+//
+// Exported because it is part of the inbox's contract rather than an internal
+// detail — the worker's pacing and the dead-letter timing both follow from it,
+// and a formula that cannot be unit-tested tends to be wrong in the tail.
+func BackoffFor(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := backoffBase
+	for range attempts - 1 {
+		delay *= 2
+		if delay >= backoffCap {
+			delay = backoffCap
+			break
+		}
+	}
+	// math/rand, not crypto/rand: this is spreading load, not keeping a secret.
+	spread := float64(delay) * jitterFraction
+	return time.Duration(float64(delay) + (rand.Float64()*2-1)*spread)
 }
 
-func (r *Repo) finish(ctx context.Context, q db.Conn, id, token uuid.UUID, state, note string, at *time.Time) error {
+// Fail releases a claim after a failed attempt, scheduling when it may be tried
+// again.
+//
+// The schedule is the whole point. Without it this method returned the row to
+// 'failed' and the claim query took it back on the very next poll, so a blip
+// lasting a second burned every attempt in milliseconds and dead-lettered a real
+// payment. The attempt budget is meant to measure persistence, not speed.
+func (r *Repo) Fail(ctx context.Context, q db.Conn, id, token uuid.UUID, cause string, attempts int, now time.Time) error {
+	next := now.Add(BackoffFor(attempts))
+	return r.finish(ctx, q, id, token, "failed", cause, nil, &next)
+}
+
+func (r *Repo) finish(ctx context.Context, q db.Conn, id, token uuid.UUID, state, note string, at, nextAttempt *time.Time) error {
 	tag, err := q.Exec(ctx, `
 		UPDATE webhook_events
 		SET processing_state = $3,
 		    last_error = $4,
 		    processed_at = COALESCE($5, processed_at),
+		    next_attempt_at = COALESCE($6, next_attempt_at),
 		    lease_token = NULL,
 		    leased_until = NULL
 		WHERE id = $1 AND lease_token = $2
-	`, id, token, state, note, at)
+	`, id, token, state, note, at, nextAttempt)
 	if err != nil {
 		return fmt.Errorf("inbox: finish %s as %s: %w", id, state, db.Normalize(err))
 	}
@@ -172,12 +222,19 @@ func (r *Repo) finish(ctx context.Context, q db.Conn, id, token uuid.UUID, state
 // so the claim query finds them again. Without this, a 'processing' row is
 // stranded forever — which is exactly what the schema permitted before
 // migration 000004 gave it a deadline.
+//
+// A reaped row becomes due immediately, and deliberately does not go through
+// BackoffFor. The reap itself only happens once the lease deadline has passed, so
+// the pacing is already there: a worker that keeps dying on the same payload
+// retries at lease-deadline intervals, not in a tight loop. Duplicating the
+// backoff formula in SQL to gain nothing is the trade this avoids.
 func (r *Repo) ReapExpiredLeases(ctx context.Context, q db.Conn, now time.Time) (int64, error) {
 	tag, err := q.Exec(ctx, `
 		UPDATE webhook_events
 		SET processing_state = 'failed',
 		    lease_token = NULL,
 		    leased_until = NULL,
+		    next_attempt_at = $1,
 		    last_error = 'lease expired; the worker holding it did not finish'
 		WHERE processing_state = 'processing' AND leased_until <= $1
 	`, now)

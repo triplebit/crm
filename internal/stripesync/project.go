@@ -134,9 +134,11 @@ func (p *Projector) ProcessOne(ctx context.Context, leaseFor time.Duration) (boo
 	}
 
 	if err := p.project(ctx, event, via); err != nil {
-		// Failure returns the event for another attempt. The cause is stored
+		// Failure returns the event for a LATER attempt: Claim reports the
+		// attempt number, and Fail turns it into a due time. The cause is stored
 		// on the row, so a human reading the inbox sees why.
-		if failErr := p.inbox.Fail(ctx, p.pool.Conn(), event.ID, token, err.Error()); failErr != nil {
+		if failErr := p.inbox.Fail(ctx, p.pool.Conn(), event.ID, token, err.Error(),
+			event.Attempts, p.now().UTC()); failErr != nil {
 			return true, fmt.Errorf("%w (and releasing the claim failed: %v)", err, failErr)
 		}
 		return true, err
