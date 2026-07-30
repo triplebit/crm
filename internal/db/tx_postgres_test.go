@@ -12,11 +12,29 @@ import (
 	"triplebit.org/portal/internal/testdb"
 )
 
+// scratchSchema holds the throwaway tables these tests create.
+//
+// They must not live in `public`. `go test ./...` runs package binaries
+// concurrently against one shared database, so a scratch table in `public` is
+// visible to the migrations package's schema assertions while it exists, and
+// made them fail intermittently with "schema has 41 tables, want 40" — a flake
+// that passed in isolation every time and, because cleanup is best effort,
+// could survive a crashed run and become permanent.
+//
+// A dedicated schema fixes it at the source and needs no cooperation from the
+// other package. Temporary tables would not work here: the write-skew tests
+// need two sessions to see the same table, and a temp table is per-session.
+const scratchSchema = "db_test_scratch"
+
 // setupCounters creates a two-row table for provoking serialization failures.
 // Each test gets its own table, so tests stay independent in a shared database.
 func setupCounters(t *testing.T, ctx context.Context, pool *db.Pool) string {
 	t.Helper()
-	table := "tx_test_" + uuid.New().String()[:8]
+	if _, err := pool.Conn().Exec(ctx,
+		`CREATE SCHEMA IF NOT EXISTS `+scratchSchema); err != nil {
+		t.Fatalf("create scratch schema: %v", err)
+	}
+	table := scratchSchema + ".tx_test_" + uuid.New().String()[:8]
 	if _, err := pool.Conn().Exec(ctx,
 		`CREATE TABLE `+table+` (id int PRIMARY KEY, n int NOT NULL)`); err != nil {
 		t.Fatalf("create %s: %v", table, err)

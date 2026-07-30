@@ -45,21 +45,66 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+// expectedTables is every table 000001 creates. Naming them, rather than
+// counting them, means a failure says which table is missing or unexpected
+// instead of only that a number changed.
+var expectedTables = []string{
+	"acknowledgment_deliveries", "acknowledgments", "assets", "audit_events",
+	"browser_sessions", "catalog_items", "catalog_price_versions", "consents",
+	"disputes", "donations", "donor_notes", "donor_tags", "effective_groups",
+	"entitlement_projections", "financial_invalidations", "fulfillments",
+	"guest_donor_tags", "guest_donors", "hotspot_device_replacement_requirements",
+	"inventory", "inventory_reservations", "invoices", "memberships", "order_lines",
+	"order_state_history", "orders", "outbox_jobs", "payment_attempts", "refunds",
+	"staff_alerts", "staff_roles", "stripe_bank_setup_attempts",
+	"stripe_customer_creation_intents", "stripe_customers",
+	"stripe_projection_applications", "stripe_reconciliation_checkpoints",
+	"stripe_reconciliation_object_failures", "user_donor_tags", "users",
+	"webhook_events",
+}
+
 func TestSchemaCreatesEveryExpectedTable(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Pool(t)
 
-	var count int
-	if err := pool.Conn().QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables
+	rows, err := pool.Conn().Query(ctx, `
+		SELECT table_name FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
 		  AND table_name <> 'schema_migrations'
-	`).Scan(&count); err != nil {
-		t.Fatalf("count tables: %v", err)
+		ORDER BY table_name
+	`)
+	if err != nil {
+		t.Fatalf("list tables: %v", err)
 	}
-	const want = 40
-	if count != want {
-		t.Errorf("schema has %d tables, want %d", count, want)
+	defer rows.Close()
+
+	found := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan table name: %v", err)
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate tables: %v", err)
+	}
+
+	want := make(map[string]bool, len(expectedTables))
+	for _, name := range expectedTables {
+		want[name] = true
+		if !found[name] {
+			t.Errorf("table %q is missing from the schema", name)
+		}
+	}
+	for name := range found {
+		if !want[name] {
+			t.Errorf("unexpected table %q in the public schema", name)
+		}
+	}
+
+	if len(expectedTables) != 40 {
+		t.Errorf("expectedTables lists %d tables, want 40", len(expectedTables))
 	}
 }
 
