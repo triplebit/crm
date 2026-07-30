@@ -21,6 +21,7 @@ import (
 	"triplebit.org/portal/internal/repo/accounts"
 	"triplebit.org/portal/internal/repo/catalogdb"
 	"triplebit.org/portal/internal/repo/customers"
+	"triplebit.org/portal/internal/repo/inbox"
 	"triplebit.org/portal/internal/repo/orders"
 	"triplebit.org/portal/internal/stripepay"
 	"triplebit.org/portal/internal/web"
@@ -119,6 +120,13 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	webhooks, err := stripepay.NewWebhookVerifier(stripeEnv,
+		cfg.Stripe.MembershipsWebhookSecret, cfg.Stripe.DonationsWebhookSecret,
+		cfg.Stripe.MembershipsAccountID, cfg.Stripe.DonationsAccountID)
+	if err != nil {
+		return err
+	}
+
 	var proxyCIDRs []string
 	if cfg.TrustProxy {
 		proxyCIDRs = cfg.TrustedProxyCIDRs
@@ -127,6 +135,10 @@ func runServe(ctx context.Context, args []string) error {
 		Sessions:          sessions,
 		OIDC:              oidc,
 		Checkout:          checkoutSvc,
+		Webhooks:          webhooks,
+		Inbox:             inbox.New(),
+		Pool:              pool,
+		StripeEnv:         stripeEnv,
 		Jar:               jar,
 		Logger:            logger,
 		BaseURL:           cfg.BaseURL,

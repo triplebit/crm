@@ -31,6 +31,8 @@ import (
 type settlementFixture struct {
 	pool      *db.Pool
 	fake      *stripetest.Server
+	pay       *stripepay.Client
+	svc       *checkout.Service
 	projector *stripesync.Projector
 	inbox     *inbox.Repo
 	person    checkout.Person
@@ -106,7 +108,8 @@ func newSettlement(t *testing.T, program string) *settlementFixture {
 	}
 
 	return &settlementFixture{
-		pool: pool, fake: fake, projector: projector, inbox: inbox.New(),
+		pool: pool, fake: fake, pay: pay, svc: svc,
+		projector: projector, inbox: inbox.New(),
 		person: person, orderID: orderID, sessionID: sessionID,
 	}
 }
@@ -307,7 +310,13 @@ func TestStaleObservationIsRefused(t *testing.T) {
 // reservation recovery, arriving from Stripe rather than from the sweep.
 func TestExpiredSessionReleasesReservations(t *testing.T) {
 	f := newSettlement(t, "hotspot")
-	ctx := context.Background()
+
+	// Prove there is something to release first. Without this the assertion
+	// below passes against an order that never held any stock, which is what
+	// it did until the worker's sweep test tripped over the same gap.
+	if f.heldReservations(t) == 0 {
+		t.Fatal("the order holds no stock; this test would prove nothing")
+	}
 
 	f.fake.ExpireSession(f.sessionID)
 	f.receive(t, "checkout.session.expired", f.sessionID, core.Memberships)
@@ -316,17 +325,23 @@ func TestExpiredSessionReleasesReservations(t *testing.T) {
 	if got := f.orderState(t); got != "expired" {
 		t.Errorf("order state = %s, want expired", got)
 	}
+	if held := f.heldReservations(t); held != 0 {
+		t.Errorf("%d reservations still held after expiry", held)
+	}
+}
+
+// heldReservations counts the stock this order is holding.
+func (f *settlementFixture) heldReservations(t *testing.T) int {
+	t.Helper()
 	var held int
-	if err := f.pool.Conn().QueryRow(ctx, `
+	if err := f.pool.Conn().QueryRow(context.Background(), `
 		SELECT count(*) FROM inventory_reservations r
 		JOIN order_lines l ON l.id = r.order_line_id
 		WHERE l.order_id = $1 AND r.state = 'held'
 	`, f.orderID).Scan(&held); err != nil {
-		t.Fatalf("count held: %v", err)
+		t.Fatalf("count held reservations: %v", err)
 	}
-	if held != 0 {
-		t.Errorf("%d reservations still held after expiry", held)
-	}
+	return held
 }
 
 // A custom-amount Friends subscription anchors on its order line, because the
@@ -420,11 +435,27 @@ func seedSellable(t *testing.T, pool *db.Pool, program string) string {
 		kind, prog, account = "friends_tier", "friends", core.Donations
 	}
 	slug := "proj-" + uuid.New().String()[:8]
+	// A hotspot tier ships a SIM card and is inventory-tracked in production,
+	// so the fixture models that. It matters: with an untracked item the order
+	// holds no reservations, and every assertion here about stock being
+	// released would pass by describing nothing.
+	tracked := kind == "hotspot_tier"
 	item, err := repo.UpsertItem(ctx, pool.Conn(), catalogdb.Item{
 		Slug: slug, Name: "Projection " + slug, Kind: kind, Program: prog,
+		RequiresShipping: tracked, RequiresIMEI: tracked, InventoryTracked: tracked,
 	})
 	if err != nil {
 		t.Fatalf("seed item: %v", err)
+	}
+	if tracked {
+		if _, err := pool.Conn().Exec(ctx, `
+			INSERT INTO inventory (id, catalog_item_id, variant, on_hand, reserved, safety_stock)
+			VALUES ($1, $2, 'default', 5, 0, 0)
+			ON CONFLICT (catalog_item_id, variant)
+				DO UPDATE SET on_hand = EXCLUDED.on_hand, reserved = 0
+		`, uuid.New(), item.ID); err != nil {
+			t.Fatalf("seed inventory: %v", err)
+		}
 	}
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
 	versionID, err := repo.InsertPriceVersion(ctx, pool.Conn(), catalogdb.PriceVersion{

@@ -9,6 +9,7 @@ import (
 
 	"triplebit.org/portal/internal/auth"
 	"triplebit.org/portal/internal/checkout"
+	"triplebit.org/portal/internal/core"
 	"triplebit.org/portal/internal/money"
 	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/web/viewdata"
@@ -30,6 +31,27 @@ func (s *Server) registerRoutes() {
 	s.getAuthed("/give", s.giveForm)
 	s.postLimited("/give", s.giveSubmit)
 	s.post("/logout", s.logout)
+
+	// One endpoint per Stripe account: the path chooses which signing secret
+	// must verify the body, which is what makes an event delivered to the
+	// wrong account's endpoint a signature failure rather than a projection
+	// into the wrong ledger.
+	for _, account := range core.AccountRefs() {
+		s.webhook(webhookPath(account), s.stripeWebhook(account))
+	}
+}
+
+// webhookPaths lists the registered webhook patterns, for the same-origin
+// middleware's exemption list. Reading it from the registry means the exemption
+// cannot name a path that is not a declared webhook.
+func (s *Server) webhookPaths() []string {
+	var paths []string
+	for _, rt := range s.routes {
+		if rt.Webhook {
+			paths = append(paths, rt.Pattern)
+		}
+	}
+	return paths
 }
 
 // notices maps a query flag to the sentence the home page shows. Only these

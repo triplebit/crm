@@ -103,6 +103,8 @@ services:
       PORTAL_STRIPE_SECRET_KEY: ${PORTAL_STRIPE_SECRET_KEY:?set in .env — see .env.example}
       PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT: ${PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT:?set in .env}
       PORTAL_STRIPE_DONATIONS_ACCOUNT: ${PORTAL_STRIPE_DONATIONS_ACCOUNT:?set in .env}
+      PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET: ${PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET:?set in .env — see .env.example}
+      PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET: ${PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET:?set in .env}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -113,6 +115,34 @@ services:
     # readiness probe. Bounded, so a genuinely broken configuration is a
     # visible dead container, not an infinite crash loop that undoes the
     # binary's fail-fast posture.
+    restart: on-failure:5
+
+  # The worker is a separate service with a deliberately smaller environment:
+  # no session key, no encryption key, no OIDC credentials. It settles orders
+  # and releases stale reservations, neither of which needs to read a browser
+  # session or decrypt anybody's data — so a compromise of this container
+  # cannot do either. That is D7 expressed where it can be checked by reading,
+  # and `make compose-check` fails if a secret ever appears in this block.
+  #
+  # It is not a copy of the portal service with a different command: the
+  # difference in this block IS the security boundary.
+  worker:
+    build:
+      context: .
+      args:
+        PORTAL_REVISION: ${PORTAL_REVISION:-unknown}
+    image: triplebit-portal
+    command: ["worker"]
+    environment:
+      PORTAL_ENV: development
+      PORTAL_BASE_URL: http://localhost:8080
+      PORTAL_DATABASE_URL: postgres://portal:portal@db:5432/portal?sslmode=disable
+      PORTAL_STRIPE_SECRET_KEY: ${PORTAL_STRIPE_SECRET_KEY:?set in .env — see .env.example}
+      PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT: ${PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT:?set in .env}
+      PORTAL_STRIPE_DONATIONS_ACCOUNT: ${PORTAL_STRIPE_DONATIONS_ACCOUNT:?set in .env}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure:5
 
 volumes:

@@ -107,6 +107,14 @@ type Stripe struct {
 	SecretKey            string
 	MembershipsAccountID string
 	DonationsAccountID   string
+
+	// One webhook signing secret per account, because one endpoint per account
+	// is what makes the cross-account check enforceable: an event delivered to
+	// the wrong endpoint fails its signature. Sharing a secret between the two
+	// would silently disable that, so the verifier refuses to start when these
+	// are equal.
+	MembershipsWebhookSecret string
+	DonationsWebhookSecret   string
 }
 
 const (
@@ -148,9 +156,11 @@ func Load() (*Config, error) {
 	}
 
 	cfg.Stripe = Stripe{
-		SecretKey:            strings.TrimSpace(os.Getenv("PORTAL_STRIPE_SECRET_KEY")),
-		MembershipsAccountID: strings.TrimSpace(os.Getenv("PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT")),
-		DonationsAccountID:   strings.TrimSpace(os.Getenv("PORTAL_STRIPE_DONATIONS_ACCOUNT")),
+		SecretKey:                strings.TrimSpace(os.Getenv("PORTAL_STRIPE_SECRET_KEY")),
+		MembershipsAccountID:     strings.TrimSpace(os.Getenv("PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT")),
+		DonationsAccountID:       strings.TrimSpace(os.Getenv("PORTAL_STRIPE_DONATIONS_ACCOUNT")),
+		MembershipsWebhookSecret: strings.TrimSpace(os.Getenv("PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET")),
+		DonationsWebhookSecret:   strings.TrimSpace(os.Getenv("PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET")),
 	}
 
 	cfg.TrustProxy = l.bool("PORTAL_TRUST_PROXY", false)
@@ -179,6 +189,12 @@ func (c *Config) RequireServe() error {
 	l.require(c.Stripe.SecretKey != "", "PORTAL_STRIPE_SECRET_KEY is required")
 	l.require(c.Stripe.MembershipsAccountID != "", "PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT is required")
 	l.require(c.Stripe.DonationsAccountID != "", "PORTAL_STRIPE_DONATIONS_ACCOUNT is required")
+	// The server is the process Stripe posts to, so it needs both signing
+	// secrets. Missing means every delivery is refused and no order ever
+	// settles — a failure worth refusing to start over, because its symptom
+	// (money taken, nothing granted) appears somewhere else entirely.
+	l.require(c.Stripe.MembershipsWebhookSecret != "", "PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET is required")
+	l.require(c.Stripe.DonationsWebhookSecret != "", "PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET is required")
 
 	if c.Environment.IsProduction() {
 		l.require(strings.HasPrefix(c.OIDC.Issuer, "https://"),
@@ -204,6 +220,17 @@ func (c *Config) RequireServe() error {
 func (c *Config) RequireWorker() error {
 	l := &loader{}
 	l.require(c.DatabaseURL != "", "PORTAL_DATABASE_URL is required")
+	// Stripe credentials, because projecting an event means retrieving the
+	// object's canonical state from the API rather than trusting the payload.
+	// The webhook signing secrets are absent on purpose: the worker never sees
+	// a request, so it has nothing to verify and is not given the means to.
+	l.require(c.Stripe.SecretKey != "", "PORTAL_STRIPE_SECRET_KEY is required")
+	l.require(c.Stripe.MembershipsAccountID != "", "PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT is required")
+	l.require(c.Stripe.DonationsAccountID != "", "PORTAL_STRIPE_DONATIONS_ACCOUNT is required")
+	// The worker abandons stale checkouts, which needs the public origin only
+	// in the sense that the checkout service it borrows is built with one; the
+	// URLs it would generate are never used here.
+	l.require(c.BaseURL != nil, "PORTAL_BASE_URL is required")
 	return l.err()
 }
 

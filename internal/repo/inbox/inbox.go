@@ -189,9 +189,14 @@ func (r *Repo) ReapExpiredLeases(ctx context.Context, q db.Conn, now time.Time) 
 
 // DeadLetter is an event that has exhausted its attempts.
 type DeadLetter struct {
-	StripeID  string
-	Type      string
-	Attempts  int
+	StripeID string
+	Type     string
+	Attempts int
+
+	// Account is carried because the alert raised from this is filed per
+	// account, and an alert against the wrong account sends whoever reads it
+	// to the wrong ledger.
+	Account   core.AccountRef
 	LastError string
 }
 
@@ -200,7 +205,7 @@ type DeadLetter struct {
 // staff_alerts rows; this is the query behind that.
 func (r *Repo) DeadLetters(ctx context.Context, q db.Conn, env core.StripeEnvironment, limit int) ([]DeadLetter, error) {
 	rows, err := q.Query(ctx, `
-		SELECT stripe_event_id, event_type, attempts, last_error
+		SELECT stripe_event_id, event_type, attempts, account_ref, COALESCE(last_error, '')
 		FROM webhook_events
 		WHERE environment = $1 AND processing_state = 'failed'
 		  AND attempts >= max_attempts
@@ -215,8 +220,13 @@ func (r *Repo) DeadLetters(ctx context.Context, q db.Conn, env core.StripeEnviro
 	var out []DeadLetter
 	for rows.Next() {
 		var d DeadLetter
-		if err := rows.Scan(&d.StripeID, &d.Type, &d.Attempts, &d.LastError); err != nil {
+		var account string
+		if err := rows.Scan(&d.StripeID, &d.Type, &d.Attempts, &account, &d.LastError); err != nil {
 			return nil, fmt.Errorf("inbox: scan dead letter: %w", db.Normalize(err))
+		}
+		d.Account, err = core.ParseAccountRef(account)
+		if err != nil {
+			return nil, fmt.Errorf("inbox: dead letter %s: %w", d.StripeID, err)
 		}
 		out = append(out, d)
 	}

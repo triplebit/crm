@@ -19,6 +19,8 @@ import (
 	"triplebit.org/portal/internal/csrf"
 	"triplebit.org/portal/internal/httpx"
 	"triplebit.org/portal/internal/repo/accounts"
+	"triplebit.org/portal/internal/repo/inbox"
+	"triplebit.org/portal/internal/stripepay"
 	"triplebit.org/portal/internal/testdb"
 )
 
@@ -60,9 +62,27 @@ func newTestServer(t *testing.T) (*Server, string) {
 		t.Fatalf("NewRateLimiter: %v", err)
 	}
 
+	// StripeProduction, matching the checkout package's fixtures and leaving
+	// the sandbox environment to stripesync's. These tests store real pending
+	// webhook_events rows, and packages run concurrently against one test
+	// database: with both on sandbox, stripesync's projector claimed rows this
+	// package had just inserted and failed retrieving sessions its fake Stripe
+	// had never heard of. The queue is partitioned by environment by design, so
+	// using that partition removes the race rather than narrowing it.
+	verifier, err := stripepay.NewWebhookVerifier(core.StripeProduction,
+		testMembershipsSecret, testDonationsSecret, testMembershipsAcct, testDonationsAcct)
+	if err != nil {
+		t.Fatalf("NewWebhookVerifier: %v", err)
+	}
+
 	s := &Server{
 		mux:           http.NewServeMux(),
 		sessions:      sessions,
+		webhooks:      verifier,
+		inbox:         inbox.New(),
+		pool:          pool,
+		stripeEnv:     core.StripeProduction,
+		now:           func() time.Time { return time.Now().UTC() },
 		jar:           jar,
 		logger:        slog.New(slog.DiscardHandler),
 		authLimiter:   limiter,

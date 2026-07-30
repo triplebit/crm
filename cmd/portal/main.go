@@ -46,8 +46,9 @@ func main() {
 		err = runHealthcheck(context.Background(), args)
 	case "catalog-sync":
 		err = runCatalogSync(context.Background(), args)
-	case "worker", "bootstrap-staff",
-		"rotate-pii", "doctor":
+	case "worker":
+		err = runWorker(context.Background(), args)
+	case "bootstrap-staff", "rotate-pii", "doctor":
 		// Implemented in later milestones. Listed explicitly so an unimplemented
 		// subcommand reports that clearly, and a misspelling still exits 2.
 		err = fmt.Errorf("subcommand %q is not implemented yet", cmd)

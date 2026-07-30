@@ -351,35 +351,45 @@ func (r *Repo) Settle(ctx context.Context, q db.Conn, orderID uuid.UUID, payment
 	return true, nil
 }
 
-// ExpiredPending lists pending orders past their window, for the worker to
+// ExpiredPending lists pending orders past their window, for the sweep to
 // abandon one at a time.
 //
-// It returns identifiers rather than doing the work because abandoning needs a
-// transaction per order and a remote call before each one, and a repository is
-// the wrong place to own either. The worker composes; this just answers "which
-// ones?".
-func (r *Repo) ExpiredPending(ctx context.Context, q db.Conn, olderThan time.Time, limit int) ([]uuid.UUID, error) {
+// It lists rather than doing the work because abandoning needs a remote call
+// and a transaction per order, and a repository is the wrong place to own
+// either. It returns whole orders rather than identifiers because the caller
+// needs the account and session id to make the order unpayable first, and one
+// query answering that is better than a re-read per row.
+//
+// Scoped to one environment: a sandbox worker must never abandon a live
+// member's checkout, and both universes can share a database.
+func (r *Repo) ExpiredPending(ctx context.Context, q db.Conn, env core.StripeEnvironment, olderThan time.Time, limit int) ([]Order, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id FROM orders
-		WHERE state = 'checkout_pending' AND created_at < $1
+		SELECT id, account_ref, COALESCE(stripe_checkout_session_id, ''), created_at
+		FROM orders
+		WHERE environment = $1 AND state = 'checkout_pending' AND created_at < $2
 		ORDER BY created_at
-		LIMIT $2
-	`, olderThan, limit)
+		LIMIT $3
+	`, env.String(), olderThan, limit)
 	if err != nil {
 		return nil, fmt.Errorf("orders: list expired: %w", db.Normalize(err))
 	}
 	defer rows.Close()
 
-	var ids []uuid.UUID
+	var found []Order
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		o := Order{Environment: env, State: "checkout_pending"}
+		var account string
+		if err := rows.Scan(&o.ID, &account, &o.CheckoutSessionID, &o.CreatedAt); err != nil {
 			return nil, fmt.Errorf("orders: scan expired: %w", db.Normalize(err))
 		}
-		ids = append(ids, id)
+		o.Account, err = core.ParseAccountRef(account)
+		if err != nil {
+			return nil, fmt.Errorf("orders: expired order %s: %w", o.ID, err)
+		}
+		found = append(found, o)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("orders: iterate expired: %w", db.Normalize(err))
 	}
-	return ids, nil
+	return found, nil
 }

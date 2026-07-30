@@ -125,10 +125,23 @@ func LimitBody(next http.Handler, bytes int64) http.Handler {
 	})
 }
 
-func RequireSameOrigin(baseURL string, next http.Handler) http.Handler {
+// RequireSameOrigin refuses mutating requests that do not come from baseURL.
+//
+// exemptPaths lists the exact paths this check must skip. It exists for exactly
+// one caller shape: an endpoint a third party posts to, authenticated by a
+// signature over the body rather than by a cookie. Stripe sends neither Origin
+// nor Referer, so without the exemption every webhook delivery is refused
+// before any handler runs — settlement would silently never happen. Matching is
+// by exact path, and the web layer derives the list from its route registry, so
+// a path can only be exempt here if it was registered as a webhook there.
+func RequireSameOrigin(baseURL string, exemptPaths []string, next http.Handler) http.Handler {
 	baseURL = strings.TrimRight(baseURL, "/")
+	exempt := make(map[string]bool, len(exemptPaths))
+	for _, path := range exemptPaths {
+		exempt[path] = true
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !requiresOriginCheck(r.Method) {
+		if !requiresOriginCheck(r.Method) || exempt[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
 		}

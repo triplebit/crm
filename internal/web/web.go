@@ -12,7 +12,11 @@ import (
 	"triplebit.org/portal/internal/auth"
 	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/cookie"
+	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/httpx"
+	"triplebit.org/portal/internal/repo/inbox"
+	"triplebit.org/portal/internal/stripepay"
 )
 
 // maxFormBytes bounds every request body. The largest legitimate body this
@@ -25,8 +29,19 @@ type Options struct {
 	OIDC     *auth.OIDC
 	Checkout *checkout.Service
 
+	// Webhooks verifies Stripe's signatures; Inbox and Pool make a verified
+	// event durable. The server does nothing else with an event: the worker
+	// projects it.
+	Webhooks  *stripepay.WebhookVerifier
+	Inbox     *inbox.Repo
+	Pool      *db.Pool
+	StripeEnv core.StripeEnvironment
+
 	Jar    *cookie.Jar
 	Logger *slog.Logger
+
+	// Now is the clock, for tests. Nil means time.Now.
+	Now func() time.Time
 
 	// BaseURL is the public origin, used for the same-origin check on
 	// mutating requests.
@@ -53,6 +68,11 @@ type Server struct {
 	sessions    *auth.Sessions
 	oidc        *auth.OIDC
 	checkout    *checkout.Service
+	webhooks    *stripepay.WebhookVerifier
+	inbox       *inbox.Repo
+	pool        *db.Pool
+	stripeEnv   core.StripeEnvironment
+	now         func() time.Time
 	jar         *cookie.Jar
 	logger      *slog.Logger
 	authLimiter *httpx.RateLimiter
@@ -76,6 +96,14 @@ func New(opts Options) (http.Handler, error) {
 		return nil, errors.New("web: an OIDC client is required")
 	case opts.Checkout == nil:
 		return nil, errors.New("web: a checkout service is required")
+	case opts.Webhooks == nil:
+		return nil, errors.New("web: a webhook verifier is required")
+	case opts.Inbox == nil:
+		return nil, errors.New("web: a webhook inbox is required")
+	case opts.Pool == nil:
+		return nil, errors.New("web: a database pool is required")
+	case opts.StripeEnv.IsZero():
+		return nil, errors.New("web: a Stripe environment is required")
 	case opts.Jar == nil:
 		return nil, errors.New("web: a cookie jar is required")
 	case opts.BaseURL == nil:
@@ -84,6 +112,10 @@ func New(opts Options) (http.Handler, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
 	}
 	loginTTL := opts.LoginTTL
 	if loginTTL <= 0 {
@@ -106,6 +138,11 @@ func New(opts Options) (http.Handler, error) {
 		sessions:      opts.Sessions,
 		oidc:          opts.OIDC,
 		checkout:      opts.Checkout,
+		webhooks:      opts.Webhooks,
+		inbox:         opts.Inbox,
+		pool:          opts.Pool,
+		stripeEnv:     opts.StripeEnv,
+		now:           now,
 		jar:           opts.Jar,
 		logger:        logger,
 		authLimiter:   authLimiter,
@@ -120,9 +157,14 @@ func New(opts Options) (http.Handler, error) {
 
 	// Innermost to outermost: routes, body cap, same-origin on mutations,
 	// client-address resolution, then logging/recovery/headers.
+	//
+	// The same-origin exemption list is derived from the route registry rather
+	// than written out, so a path can only be exempt if it was registered as a
+	// webhook — which the registrar and its tests already constrain. Writing
+	// the paths twice is how the two drift apart.
 	var root http.Handler = s.mux
 	root = httpx.LimitBody(root, maxFormBytes)
-	root = httpx.RequireSameOrigin(opts.BaseURL.String(), root)
+	root = httpx.RequireSameOrigin(opts.BaseURL.String(), s.webhookPaths(), root)
 	if s.trustProxy {
 		root, err = httpx.TrustProxyHeaders(opts.TrustedProxyCIDRs, root)
 		if err != nil {

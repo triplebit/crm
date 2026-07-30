@@ -52,6 +52,7 @@ type Service struct {
 	pool      *db.Pool
 	pay       *stripepay.Client
 	pii       *cryptox.PII
+	abandoner *Abandoner
 	env       core.StripeEnvironment
 	baseURL   string
 	now       func() time.Time
@@ -121,6 +122,10 @@ func New(opts Options) (*Service, error) {
 			}
 		}
 	}
+	abandoner, err := NewAbandoner(opts.Orders, opts.Pool, opts.Pay, opts.Environment, now)
+	if err != nil {
+		return nil, err
+	}
 	return &Service{
 		customers: opts.Customers,
 		orders:    opts.Orders,
@@ -128,6 +133,7 @@ func New(opts Options) (*Service, error) {
 		pool:      opts.Pool,
 		pay:       opts.Pay,
 		pii:       pii,
+		abandoner: abandoner,
 		env:       opts.Environment,
 		baseURL:   strings.TrimRight(opts.BaseURL, "/"),
 		now:       now,

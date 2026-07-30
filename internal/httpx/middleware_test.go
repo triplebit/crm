@@ -11,7 +11,7 @@ import (
 )
 
 func TestRequireSameOrigin(t *testing.T) {
-	handler := RequireSameOrigin("https://donate.triplebit.org", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	handler := RequireSameOrigin("https://donate.triplebit.org", nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
@@ -375,7 +375,7 @@ func TestAccessAndPanicLogsCarryTheRealRequestID(t *testing.T) {
 // fail-open default gets forgotten.
 func TestRequireSameOriginFailsClosedOnEmptyBase(t *testing.T) {
 	t.Parallel()
-	handler := RequireSameOrigin("", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	handler := RequireSameOrigin("", nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	r := httptest.NewRequest(http.MethodPost, "https://x.test/", nil)

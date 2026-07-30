@@ -115,6 +115,8 @@ compose-check:
 	PORTAL_STRIPE_SECRET_KEY=check \
 	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
+	PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
 	POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
 	docker compose --env-file /dev/null config -q
 	@# And prove the required-variable guards are guards: with one unset,
@@ -126,9 +128,32 @@ compose-check:
 		PORTAL_STRIPE_SECRET_KEY=check \
 		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+		PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
+		PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
 		POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
 		docker compose --env-file /dev/null config -q 2>/dev/null; then \
 		echo "compose accepted a missing PORTAL_SESSION_KEY; the required-variable guard is not a guard"; \
+		exit 1; \
+	fi
+	@# D7, checked rather than promised: the worker container must never be
+	@# handed the session or PII keys. It cannot use them — RequireWorker has
+	@# an AST test forbidding it from naming them — but a secret present in a
+	@# compromised container's environment is exposed whether the process reads
+	@# it or not. The worker block was written by copying the portal block,
+	@# which is exactly how a key gets carried along by accident.
+	@if PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
+		PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+		PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+		PORTAL_STRIPE_SECRET_KEY=check \
+		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+		PORTAL_STRIPE_MEMBERSHIPS_WEBHOOK_SECRET=check \
+		PORTAL_STRIPE_DONATIONS_WEBHOOK_SECRET=check \
+		POCKET_ID_ENCRYPTION_KEY=checkcheckcheck \
+		docker compose --env-file /dev/null config \
+		| awk '/^  worker:/{inside=1; next} /^  [a-z]/{inside=0} inside' \
+		| grep -E 'PORTAL_(SESSION_KEY|ENCRYPTION_KEY|OIDC)'; then \
+		echo "the worker service is configured with session, PII or OIDC secrets it must never hold (D7)"; \
 		exit 1; \
 	fi
 
