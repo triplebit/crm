@@ -125,9 +125,20 @@ func TestRegistryHasNoUnprotectedMutatingRoute(t *testing.T) {
 	if len(s.routes) == 0 {
 		t.Fatal("the route registry is empty; registerRoutes did not run")
 	}
-	mutating := 0
+	mutating, webhooks := 0, 0
 	for _, rt := range s.routes {
 		if rt.Method == http.MethodGet {
+			continue
+		}
+		if rt.Webhook {
+			// The declared exception. It carries no session and no CSRF by
+			// design — it authenticates the body's signature instead — so what
+			// the registry can assert is that the exception is deliberate and
+			// that it claims neither protection it does not have.
+			webhooks++
+			if rt.RequiresSession || rt.ValidatesCSRF {
+				t.Errorf("%s %s is a webhook yet claims session/CSRF protection", rt.Method, rt.Pattern)
+			}
 			continue
 		}
 		mutating++
@@ -138,6 +149,11 @@ func TestRegistryHasNoUnprotectedMutatingRoute(t *testing.T) {
 			t.Errorf("%s %s does not validate CSRF", rt.Method, rt.Pattern)
 		}
 	}
+	// D8's exception must stay countable: if this number grows, someone should
+	// have to explain why in a review.
+	if webhooks > 2 {
+		t.Errorf("%d webhook routes; D8 allows one endpoint per Stripe account and no more", webhooks)
+	}
 	if mutating == 0 {
 		t.Fatal("no mutating routes are registered; the assertions above ran against nothing")
 	}
@@ -147,7 +163,7 @@ func TestEveryMutatingRouteRefusesAnonymousRequests(t *testing.T) {
 	s, _ := newTestServer(t)
 
 	for _, rt := range s.routes {
-		if rt.Method == http.MethodGet {
+		if rt.Method == http.MethodGet || rt.Webhook {
 			continue
 		}
 		w := s.do(t, rt.Method, rt.Pattern, "", "")
@@ -161,7 +177,7 @@ func TestEveryMutatingRouteRefusesRequestsWithoutACSRFToken(t *testing.T) {
 	s, token := newTestServer(t)
 
 	for _, rt := range s.routes {
-		if rt.Method == http.MethodGet {
+		if rt.Method == http.MethodGet || rt.Webhook {
 			continue
 		}
 		// A live session and no token: the case a cross-site form submission

@@ -46,10 +46,15 @@ type route struct {
 	// anonymous POSTs outright.
 	RequiresSession bool
 
-	// ValidatesCSRF is true for every mutating route. A future router.Webhook
-	// will be the single, greppable exception; until one exists there is no
-	// exception at all.
+	// ValidatesCSRF is true for every mutating route except a webhook, which
+	// authenticates by signature instead — see Webhook.
 	ValidatesCSRF bool
+
+	// Webhook marks the one route shape that mutates without a session or a
+	// CSRF token. It is a separate flag rather than an absence so the registry
+	// tests can require every exception to be deliberate, and so `grep
+	// Webhook` finds all of them.
+	Webhook bool
 
 	// RateLimited applies the per-client auth limiter before anything else —
 	// including the session load, so a flood of requests bearing fabricated
@@ -93,6 +98,21 @@ func (s *Server) postLimited(pattern string, h handler) {
 	}, h)
 }
 
+// Webhook registers the single kind of mutating route that carries no session
+// and no CSRF token: an endpoint Stripe posts to.
+//
+// This is D8's one exception, and it is narrow by construction. A webhook
+// cannot use CSRF (there is no page and no session to derive a token from) or
+// a session (Stripe is not signed in), so its authentication is the signature
+// over the request body — which is strictly stronger than either, because it
+// proves the body itself came from Stripe rather than proving a browser had a
+// cookie. The handler MUST verify that signature before acting; the registrar
+// cannot enforce that, which is precisely why there is exactly one of these
+// and it is named.
+func (s *Server) webhook(pattern string, h handler) {
+	s.register(route{Method: http.MethodPost, Pattern: pattern, Webhook: true}, h)
+}
+
 func (s *Server) register(rt route, h handler) {
 	// Impossible combinations are refused at startup, not discovered at
 	// request time: CSRF validation reads the session's secret, so without a
@@ -105,6 +125,17 @@ func (s *Server) register(rt route, h handler) {
 	}
 	if rt.ValidatesCSRF && !csrf.Required(rt.Method) {
 		panic(fmt.Sprintf("web: route %s %s claims CSRF validation on a method the check exempts", rt.Method, rt.Pattern))
+	}
+	// A mutating route is protected by CSRF or it is a declared webhook. There
+	// is no third option, and forgetting to choose is a startup panic rather
+	// than an unprotected endpoint.
+	if csrf.Required(rt.Method) && !rt.ValidatesCSRF && !rt.Webhook {
+		panic(fmt.Sprintf("web: route %s %s mutates without CSRF and is not a declared webhook",
+			rt.Method, rt.Pattern))
+	}
+	if rt.Webhook && (rt.ValidatesCSRF || rt.RequiresSession) {
+		panic(fmt.Sprintf("web: route %s %s is a webhook and cannot also require a session or CSRF",
+			rt.Method, rt.Pattern))
 	}
 
 	s.routes = append(s.routes, rt)
