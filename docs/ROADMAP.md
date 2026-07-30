@@ -3,14 +3,14 @@
 Progress tracker for the rebuild. Every milestone ends in a command a human runs
 whose output is the gate — never "wrote package X".
 
-**Status: M2 in progress.**
+**Status: M3 next.**
 
 | | Milestone | Gate | Status |
 |---|---|---|---|
 | M0 | Repo can prove itself | CI green on GitHub | ✅ done |
 | M1 | Schema, migrations, `WithTx` | migrate twice; 40 tables; real 40001 retried | ✅ done |
-| M2 | Leaf packages | their tests, plus layering clean | 🔨 in progress |
-| M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ⬜ |
+| M2 | Leaf packages | their tests, plus layering clean | ✅ done |
+| M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ⬜ next |
 | M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ⬜ |
 | M5 | Money out | a real test card reaches Stripe Checkout | ⬜ |
 | M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ |
@@ -68,21 +68,28 @@ CI with no `continue-on-error`; `make check` runs exactly what CI runs;
 `internal/db` provides one `Conn` interface where there were six, and `WithTx`
 makes serialization-failure retry a field rather than a project.
 
-### M2 — leaf packages 🔨
+### M2 — leaf packages ✅
 
-Port `safeerr`, `cryptox`, `httpx`, `csrf`; add `cookie`, `tokens`, `money`,
-`redact`. Two behaviour changes while porting:
+Ported `safeerr`, `cryptox`, `httpx` and the CSRF primitives; added `cookie`,
+`tokens`, `money` and `redact`.
 
-- **`httpx` XFF fix.** One malformed `X-Forwarded-For` currently collapses every
-  rate limit into a single global bucket, so 20 requests lock every user out of
-  login and checkout for ten minutes.
-- **`csrf` path binding dropped.** Binding tokens to `"METHOD /path"` forced
-  three parallel hardcoded lists and a 200-line render function, and defends
-  against a threat that requires the attacker to already hold the victim's
-  token.
-
-`cookie` is new and exists so that a `__Host-` prefixed cookie with a non-root
-path cannot be written: no exported type in the package has a `Path` field.
+- **Fixed an X-Forwarded-For denial of service.** One malformed entry rejected
+  the whole header and fell back to the network peer, which is Caddy — so about
+  twenty poisoned requests shared one rate-limit bucket and locked every user
+  out of login and checkout for ten minutes. The regression test was confirmed
+  to fail against the original implementation first.
+- **Dropped CSRF path binding**, which had forced three parallel hardcoded path
+  lists and a 200-line render function while defending against a threat that
+  requires already holding the victim's token. Also switched from `FormValue`
+  to `PostForm`, so a token can no longer be supplied in a URL.
+- **Deleted `httpx.Cookie`.** It exposed `Path` and `Domain` as caller fields,
+  which is how a `__Host-` cookie came to be set with `Path=/account` and was
+  silently discarded by every browser. No exported type in `internal/cookie`
+  has a `Path` field, and `make lint-cookie` fails the build on any other
+  `Set-Cookie` writer.
+- **`redact`** makes personal data a type that renders as `[redacted]` through
+  every standard-library path, with compile-time proof each interface is
+  implemented. Disclosure requires a greppable `.Reveal()`.
 
 ### M3 — a real member can sign in
 
