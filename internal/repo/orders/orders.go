@@ -87,8 +87,8 @@ func (r *Repo) CreatePending(ctx context.Context, q db.Conn, o Order, lines []Li
 			                         amount, currency, quantity,
 			                         requires_shipping, inventory_tracked, account_ref)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		`, line.ID, o.ID, line.LineNumber, line.CatalogItemID,
-			line.CatalogPriceVersionID, line.Kind, line.Slug, line.Name,
+		`, line.ID, o.ID, line.LineNumber, nullUUID(line.CatalogItemID),
+			nullUUID(line.CatalogPriceVersionID), line.Kind, line.Slug, line.Name,
 			line.StripeProductID, line.StripePriceID,
 			line.Amount, line.Currency, line.Quantity,
 			line.RequiresShipping, line.InventoryTracked, line.Account.String())
@@ -185,7 +185,9 @@ func (r *Repo) PendingForUser(ctx context.Context, q db.Conn, userID uuid.UUID, 
 // Lines returns an order's lines in order.
 func (r *Repo) Lines(ctx context.Context, q db.Conn, orderID uuid.UUID) ([]Line, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, line_number, catalog_item_id, catalog_price_version_id,
+		SELECT id, line_number,
+		       COALESCE(catalog_item_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		       COALESCE(catalog_price_version_id, '00000000-0000-0000-0000-000000000000'::uuid),
 		       kind, slug, name, stripe_product_id, stripe_price_id,
 		       amount, currency, quantity, requires_shipping, inventory_tracked, account_ref
 		FROM order_lines WHERE order_id = $1 ORDER BY line_number
@@ -217,4 +219,15 @@ func (r *Repo) Lines(ctx context.Context, q db.Conn, orderID uuid.UUID) ([]Line,
 		return nil, fmt.Errorf("orders: iterate lines: %w", db.Normalize(err))
 	}
 	return out, nil
+}
+
+// nullUUID maps the zero UUID to SQL NULL. A line for a member-chosen
+// donation amount has no catalog item and no price version — the member set
+// the price — and the zero value must reach the database as absence, not as
+// a reference to a row that cannot exist.
+func nullUUID(id uuid.UUID) *uuid.UUID {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &id
 }

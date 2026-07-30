@@ -19,12 +19,23 @@ import (
 	"triplebit.org/portal/internal/stripepay"
 )
 
-// sessionLifetime is how long the hosted Checkout page stays valid. Stripe's
-// floor is 30 minutes; the inventory hold matches it plus a grace margin, so
-// stock is never released while a page could still complete.
+// The hosted Checkout page's lifetime is deliberately left to Stripe's
+// default (24 hours) rather than pinned by this service.
+//
+// That is not laziness, it is the fix for a real bug: a session's create
+// parameters must be byte-identical across attempts, because the order's
+// idempotency key is what makes the crash window recoverable. An expires_at
+// computed from "now" differs on every attempt, so Stripe rejected the
+// replay with idempotency_error — a failure the resume test missed only
+// because both of its attempts happened to land inside the same second. The
+// clock is now absent from the parameters entirely, so a resume is exact
+// however much later it arrives.
+//
+// The inventory hold spans that same window plus a margin, so stock is never
+// released while a member could still be paying for it.
 const (
-	sessionLifetime  = 30 * time.Minute
-	reservationGrace = 10 * time.Minute
+	sessionLifetime  = 24 * time.Hour
+	reservationGrace = 1 * time.Hour
 )
 
 var imeiPattern = regexp.MustCompile(`^[0-9]{14,16}$`)
@@ -65,13 +76,10 @@ type EnrollmentRequest struct {
 // returns the same Session. Nothing is charged by any of this; charging is
 // M6's webhook business.
 func (s *Service) StartEnrollment(ctx context.Context, person Person, req EnrollmentRequest) (string, error) {
-	// Resume-or-refuse before anything else: the schema allows one pending
-	// membership order per person, and the right response to a double-click
-	// or a crashed attempt is the same Checkout page, not an error.
-	if url, ok, err := s.resumePending(ctx, person, "hotspot"); err != nil || ok {
-		return url, err
-	}
-
+	// Validate before resuming. A member whose input is wrong must be told
+	// so, even if they happen to have a pending order — resuming first would
+	// answer a typo with someone's forgotten checkout page and explain
+	// nothing.
 	tier, tierVersion, err := s.sellable(ctx, req.TierSlug, "hotspot_tier")
 	if err != nil {
 		return "", err
@@ -85,24 +93,32 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		lines = append(lines, pendingLine{item: device, version: deviceVersion, quantity: 1})
 	}
 
-	orderID := uuid.New()
-	imeiSealed := ""
-	if !req.IncludeDevice {
-		imei := strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")
-		if !imeiPattern.MatchString(imei) {
-			return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
-				"Enter your device's IMEI: 14 to 16 digits, usually under Settings → About.")
-		}
-		imeiSealed, err = s.keys.Encrypt([]byte(imei), orderAAD(orderID, "imei"))
-		if err != nil {
-			return "", fmt.Errorf("checkout: seal imei: %w", err)
-		}
-	} else if strings.TrimSpace(req.IMEI) != "" {
+	if strings.TrimSpace(req.IMEI) != "" && req.IncludeDevice {
 		// A device order carrying an IMEI means the form and the service
 		// disagree about who supplies it. Refuse rather than store a number
 		// staff will contradict at fulfillment.
 		return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
 			"Leave the IMEI blank when we are sending you a device: we record it when it ships.")
+	}
+	if !req.IncludeDevice && !imeiPattern.MatchString(strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")) {
+		return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
+			"Enter your device's IMEI: 14 to 16 digits, usually under Settings → About.")
+	}
+
+	// Only now: the schema allows one pending membership order per person, so
+	// a double-click or a crashed attempt returns the same Checkout page.
+	if url, ok, err := s.resumePending(ctx, person, "hotspot"); err != nil || ok {
+		return url, err
+	}
+
+	orderID := uuid.New()
+	imeiSealed := ""
+	if !req.IncludeDevice {
+		imei := strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")
+		imeiSealed, err = s.keys.Encrypt([]byte(imei), orderAAD(orderID, "imei"))
+		if err != nil {
+			return "", fmt.Errorf("checkout: seal imei: %w", err)
+		}
 	}
 
 	customerID, err := s.EnsureCustomer(ctx, core.Memberships, person)
@@ -222,12 +238,15 @@ func (s *Service) createAndAttachSessionFor(ctx context.Context, order orders.Or
 		ClientReferenceID: order.ID.String(),
 		SuccessURL:        s.baseURL + "/account?checkout=done",
 		CancelURL:         s.baseURL + "/account?checkout=canceled",
-		ExpiresAt:         s.now().UTC().Add(sessionLifetime),
 	}
 	for _, line := range lines {
+		// A line with no Stripe price id is a member-chosen donation: the
+		// amount on the line is the whole record, and the inline price is
+		// rebuilt from it — identically on a first attempt and on a resume.
 		spec.Lines = append(spec.Lines, stripepay.SessionLine{
 			PriceID:  line.StripePriceID,
 			Quantity: int64(line.Quantity),
+			Donation: donationFor(line),
 		})
 		// The frozen line already records whether it ships, so the hosted
 		// page asks for an address exactly when something physical is being

@@ -130,6 +130,12 @@ func New(opts Options) (*Service, error) {
 	}, nil
 }
 
+// SetClockForTest replaces the service clock. It exists so a test can prove
+// that nothing in a Stripe request is derived from the current time — the
+// property that makes idempotent replay exact — by advancing the clock
+// between two attempts and requiring the same session back.
+func (s *Service) SetClockForTest(now func() time.Time) { s.now = now }
+
 // Person is who the Customer belongs to, with the identity claims Stripe
 // gets to see (they appear on receipts).
 type Person struct {

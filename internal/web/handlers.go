@@ -27,6 +27,8 @@ func (s *Server) registerRoutes() {
 	s.getAuthed("/account", s.account)
 	s.getAuthed("/enroll", s.enrollForm)
 	s.post("/enroll", s.enrollSubmit)
+	s.getAuthed("/give", s.giveForm)
+	s.post("/give", s.giveSubmit)
 	s.post("/logout", s.logout)
 }
 
@@ -242,6 +244,66 @@ func (s *Server) enrollSubmit(c *reqctx) error {
 		return view.Enroll(data).Render(c.r.Context(), c.w)
 	}
 	// Off to Stripe's hosted page. 303, so a refresh cannot resubmit.
+	http.Redirect(c.w, c.r, url, http.StatusSeeOther)
+	return nil
+}
+
+func (s *Server) giveData(c *reqctx) (viewdata.Give, error) {
+	layout, err := c.layout("Friends of Triplebit")
+	if err != nil {
+		return viewdata.Give{}, err
+	}
+	offer, err := s.checkout.FriendsOffer(c.r.Context())
+	if err != nil {
+		return viewdata.Give{}, err
+	}
+	data := viewdata.Give{
+		Layout:   layout,
+		MinLabel: offer.MinCustom.Display(),
+		MaxLabel: offer.MaxCustom.Display(),
+	}
+	for _, tier := range offer.Tiers {
+		data.Tiers = append(data.Tiers, viewdata.GiveTier{
+			Slug:       tier.Slug,
+			Name:       tier.Name,
+			PriceLabel: priceLabel(tier.Amount, tier.Interval, 1),
+		})
+	}
+	return data, nil
+}
+
+func (s *Server) giveForm(c *reqctx) error {
+	data, err := s.giveData(c)
+	if err != nil {
+		return err
+	}
+	return view.Give(data).Render(c.r.Context(), c.w)
+}
+
+func (s *Server) giveSubmit(c *reqctx) error {
+	req := checkout.FriendsRequest{
+		TierSlug:     c.r.PostForm.Get("tier"),
+		CustomAmount: c.r.PostForm.Get("custom_amount"),
+	}
+	url, err := s.checkout.StartFriends(c.r.Context(), checkout.Person{
+		UserID: c.principal.User.ID,
+		Email:  c.principal.User.Email,
+		Name:   c.principal.User.DisplayName,
+	}, req)
+	if err != nil {
+		if !safeerr.IsSafe(err) {
+			return err
+		}
+		data, dataErr := s.giveData(c)
+		if dataErr != nil {
+			return dataErr
+		}
+		data.Error = safeerr.Message(err, "That did not work. Please check the form.")
+		data.TierSlug = req.TierSlug
+		data.CustomAmount = req.CustomAmount
+		c.w.WriteHeader(safeerr.StatusOf(err, http.StatusUnprocessableEntity))
+		return view.Give(data).Render(c.r.Context(), c.w)
+	}
 	http.Redirect(c.w, c.r, url, http.StatusSeeOther)
 	return nil
 }

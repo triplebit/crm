@@ -128,6 +128,19 @@ Order draft → inventory reservation → Stripe Checkout Session → attach →
 redirect. Includes the crash-window recovery path for "Stripe created the
 Session but we died before storing its ID".
 
+**Friends is in V1 after all** — the owner asked for it with the real
+catalog, and it shares the enrolment machinery rather than duplicating it, so
+it cost far less than the ~200 lines its deferral estimated. It adds the one
+place an amount legitimately arrives from a browser: a member choosing what
+to give monthly. That is not a price being trusted (a price says what a thing
+costs and must come from the catalog); it is a person's decision, parsed to
+exact cents server-side and bounded.
+
+Known UX gap for M7: a member with a pending order who submits a *different*
+valid choice is resumed to their existing checkout rather than told about it.
+The schema permits one pending order per programme, so nothing is lost — but
+the silence should become a sentence.
+
 **M5 and M6 are one deployable unit.** Between them, money moves and nothing
 records it. Fine as a milestone boundary; unacceptable as a deployed state.
 Nothing built in M5 reaches a live Stripe account until M6's gate passes.
@@ -209,7 +222,6 @@ Each is a route or a package, not a principle.
 
 | Deferred | Why |
 |---|---|
-| Friends programme | Structurally identical to hotspot; ~200 lines later |
 | Gifts, fair market value, thresholds | Largest source of validation branching |
 | ACH, bank setup, mandates | ~800 lines across five packages; card-only V1 |
 | Tier-change schedules | The Stripe Customer Portal does this |

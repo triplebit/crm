@@ -1,0 +1,40 @@
+package view
+
+import "triplebit.org/portal/internal/web/viewdata"
+
+templ Give(d viewdata.Give) {
+	@page(d.Layout) {
+		<section class="give">
+			<h1>Friends of Triplebit</h1>
+			<p>Monthly support for the network. Cancel whenever you like.</p>
+			if d.Error != "" {
+				<p class="notice error">{ d.Error }</p>
+			}
+			<form method="post" action="/give">
+				<input type="hidden" name="_csrf" value={ d.CSRFToken }/>
+				<fieldset>
+					<legend>Choose an amount</legend>
+					for _, tier := range d.Tiers {
+						<label class="option">
+							<input type="radio" name="tier" value={ tier.Slug }
+								checked?={ tier.Slug == d.TierSlug }/>
+							<strong>{ tier.PriceLabel }</strong>
+						</label>
+					}
+					<label class="option">
+						<input type="radio" name="tier" value=""
+							checked?={ d.TierSlug == "" && d.CustomAmount != "" }/>
+						<span>Another amount, monthly</span>
+					</label>
+					<label>
+						Your amount in dollars ({ d.MinLabel } – { d.MaxLabel })
+						<input type="text" name="custom_amount" inputmode="decimal"
+							placeholder="12.50" value={ d.CustomAmount }/>
+						<small>Only used when you pick “Another amount”.</small>
+					</label>
+				</fieldset>
+				<button type="submit">Continue to payment</button>
+			</form>
+		</section>
+	}
+}

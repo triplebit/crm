@@ -11,15 +11,35 @@ import (
 	"triplebit.org/portal/internal/core"
 )
 
-// SessionLine is one Checkout line item, referencing a catalog price by its
-// Stripe identifier. There is deliberately no ad-hoc amount variant for
-// catalog goods — the server resolves prices from the verified catalog, and
-// an amount that can be passed here is an amount that can be tampered with
-// upstream. (Custom-amount donations get their own explicit path when the
-// donate flow lands.)
+// SessionLine is one Checkout line item. Normally it references a catalog
+// price by its Stripe identifier: the server resolves prices from the
+// verified catalog, so no amount for a good crosses this boundary and none
+// can be tampered with upstream.
+//
+// Donation is the one exception, and it is a different kind of thing. A
+// member choosing what to give is not a price the catalog can know — the
+// amount IS their decision. Such a line carries no PriceID and instead names
+// its own amount, which the service has already parsed to exact cents and
+// bounded. The field is named Donation, not Amount, so a future caller
+// cannot reach for it while selling a device.
 type SessionLine struct {
 	PriceID  string
 	Quantity int64
+
+	Donation *DonationLine
+}
+
+// DonationLine is a member-chosen giving amount, rendered as an inline
+// Stripe price. Recurring when Interval is set.
+type DonationLine struct {
+	// ProductName is what the member sees on the hosted page and the
+	// receipt.
+	ProductName string
+	Amount      int64
+	Currency    string
+
+	Interval      string
+	IntervalCount int64
 }
 
 // SessionSpec describes a Checkout Session to create.
@@ -38,8 +58,12 @@ type SessionSpec struct {
 	SuccessURL string
 	CancelURL  string
 
-	// ExpiresAt bounds how long the hosted page can complete. Stripe
-	// requires 30 minutes to 24 hours.
+	// ExpiresAt bounds how long the hosted page can complete (Stripe allows
+	// 30 minutes to 24 hours; the default is 24 hours).
+	//
+	// Callers that rely on idempotent replay must leave this zero: a value
+	// derived from the current time makes each attempt's parameters differ,
+	// and Stripe refuses a replayed key whose parameters changed.
 	ExpiresAt time.Time
 
 	// CollectShipping asks Stripe to collect a shipping address on the
@@ -105,13 +129,48 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, account core.Account
 		}
 	}
 	for _, line := range spec.Lines {
-		if line.PriceID == "" || line.Quantity <= 0 {
-			return Session{}, errors.New("stripepay: a checkout line needs a price and a positive quantity")
+		if line.Quantity <= 0 {
+			return Session{}, errors.New("stripepay: a checkout line needs a positive quantity")
 		}
-		params.LineItems = append(params.LineItems, &stripe.CheckoutSessionCreateLineItemParams{
-			Price:    stripe.String(line.PriceID),
-			Quantity: stripe.Int64(line.Quantity),
-		})
+		item := &stripe.CheckoutSessionCreateLineItemParams{Quantity: stripe.Int64(line.Quantity)}
+		switch {
+		case line.Donation != nil && line.PriceID != "":
+			return Session{}, errors.New("stripepay: a line is either a catalog price or a donation, never both")
+
+		case line.Donation != nil:
+			d := line.Donation
+			if d.Amount <= 0 || d.Currency == "" || d.ProductName == "" {
+				return Session{}, errors.New("stripepay: a donation line needs a positive amount, a currency and a name")
+			}
+			// product_data rather than a pre-made Product: the amount is the
+			// member's, so there is no catalog price version to anchor it to.
+			// Stripe therefore accumulates one Product per custom donation —
+			// untidy in the Dashboard but harmless, and the upgrade (a single
+			// anchor Product synced from the manifest) is a later, additive
+			// change that needs no schema.
+			item.PriceData = &stripe.CheckoutSessionCreateLineItemPriceDataParams{
+				Currency:    stripe.String(d.Currency),
+				UnitAmount:  stripe.Int64(d.Amount),
+				ProductData: &stripe.CheckoutSessionCreateLineItemPriceDataProductDataParams{Name: stripe.String(d.ProductName)},
+			}
+			if d.Interval != "" {
+				count := d.IntervalCount
+				if count == 0 {
+					count = 1
+				}
+				item.PriceData.Recurring = &stripe.CheckoutSessionCreateLineItemPriceDataRecurringParams{
+					Interval:      stripe.String(d.Interval),
+					IntervalCount: stripe.Int64(count),
+				}
+			}
+
+		case line.PriceID != "":
+			item.Price = stripe.String(line.PriceID)
+
+		default:
+			return Session{}, errors.New("stripepay: a checkout line needs a catalog price or a donation")
+		}
+		params.LineItems = append(params.LineItems, item)
 	}
 
 	created, err := c.sc.V1CheckoutSessions.Create(ctx, params)

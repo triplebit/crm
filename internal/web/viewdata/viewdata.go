@@ -69,3 +69,25 @@ type Enroll struct {
 	IncludeDevice bool
 	IMEI          string
 }
+
+// GiveTier is one fixed Friends monthly option.
+type GiveTier struct {
+	Slug       string
+	Name       string
+	PriceLabel string
+}
+
+// Give is the Friends monthly-giving form.
+type Give struct {
+	Layout
+
+	Tiers []GiveTier
+
+	// MinLabel and MaxLabel bound the custom amount, pre-formatted.
+	MinLabel string
+	MaxLabel string
+
+	Error        string
+	TierSlug     string
+	CustomAmount string
+}

@@ -247,6 +247,13 @@ func TestStartEnrollmentResumesTheCrashWindow(t *testing.T) {
 		t.Fatalf("simulate crash: %v", err)
 	}
 
+	// Advance the clock past any plausible same-second coincidence. The
+	// original resume test passed only because both attempts landed inside
+	// one second, which hid a session parameter derived from time.Now: the
+	// replay then differed from the original and Stripe refused the key with
+	// idempotency_error. Found in the sandbox, not here — hence the clock.
+	svc.SetClockForTest(func() time.Time { return time.Now().Add(90 * time.Second) })
+
 	url2, err := svc.StartEnrollment(ctx, person, enrollment(tier.Slug))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
