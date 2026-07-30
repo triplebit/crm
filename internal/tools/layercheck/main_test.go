@@ -141,7 +141,29 @@ func TestRealLayerMapListsTheModuleRoot(t *testing.T) {
 // by not being the exact string "web/view".
 func TestTemplateSubpackagesAreCoveredByR4(t *testing.T) {
 	pkgs := []pkg{newPkg("web/view/email", "internal/core")}
-	assertOneProblemContaining(t, check(pkgs, testLayers), "only internal/web/viewdata")
+	assertOneProblemContaining(t, check(pkgs, testLayers), "may import only internal/web/viewdata")
+}
+
+// R4 must see third-party imports too. It previously sat after the loop's
+// skip-anything-outside-this-module continue, so a template reaching straight
+// for a database driver passed clean — the rule promised more than it checked.
+func TestTemplatesMayNotImportThirdPartyPackages(t *testing.T) {
+	direct := pkg{
+		ImportPath: mod("web/view"),
+		Imports:    []string{"github.com/jackc/pgx/v5", "context"},
+	}
+	assertOneProblemContaining(t, check([]pkg{direct}, testLayers), "may import only internal/web/viewdata")
+
+	// The standard library, viewdata, and the templ runtime the generated
+	// code needs remain fine.
+	clean := pkg{
+		ImportPath: mod("web/view"),
+		Imports: []string{"context", "strings", mod("internal/web/viewdata"),
+			"github.com/a-h/templ", "github.com/a-h/templ/runtime"},
+	}
+	if problems := check([]pkg{clean}, testLayers); len(problems) != 0 {
+		t.Errorf("a clean template package was refused: %q", problems)
+	}
 }
 
 // R5: stripe-go is a third-party import, invisible to the layer numbers, so it

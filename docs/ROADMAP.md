@@ -52,8 +52,9 @@ good and are carried forward. What was wrong was the seams.
 ### M0 — repo skeleton ✅
 
 CI with no `continue-on-error`; every CI gate is a `make` target, and
-`make check` is the offline subset (CI additionally runs `test-db`, `vuln` and
-`compose-check`); `layercheck` makes the package layering a build failure;
+`make check` is the offline subset (CI additionally runs `test-db`, `vuln`,
+`compose-check`, `docker-check`, and a probe proving the cookie lint still
+catches each pattern it claims); `layercheck` makes the package layering a build failure;
 `internal/core` with `AccountRef` and `Environment` as opaque types whose zero
 value panics.
 
@@ -318,3 +319,7 @@ make db-down
 which is right for a fast local loop. CI sets `PORTAL_REQUIRE_DB_TESTS=1`, which
 turns that skip into a failure. A database test that can silently skip in CI is
 not a test.
+
+CI runs, in order: `generate-check`, `fmt-check`, `vet`, `layercheck`,
+`lint-cookie`, the cookie-lint failure probe, `mod-verify`, `build`, `test-db`,
+`vuln`, `compose-check`, `docker-check`.

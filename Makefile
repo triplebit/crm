@@ -102,6 +102,12 @@ vuln:
 # Validates compose.yaml without starting anything. The dummy values satisfy
 # the ":?" required-variable checks, whose job is refusing a real start-up
 # without real keys — syntax validation is not a start-up.
+#
+# --env-file /dev/null makes the gate hermetic. Compose reads .env from the
+# project directory by default, so without this the check validated the
+# developer's local secrets rather than the file under test — and the
+# negative case below silently passed for the wrong reason, which is how it
+# was noticed.
 compose-check:
 	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
 	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
@@ -109,7 +115,20 @@ compose-check:
 	PORTAL_STRIPE_SECRET_KEY=check \
 	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
 	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
-	docker compose config -q
+	docker compose --env-file /dev/null config -q
+	@# And prove the required-variable guards are guards: with one unset,
+	@# compose must refuse. Otherwise a weakened ":?" that silently defaulted
+	@# would produce identical valid output to a correct one.
+	@if PORTAL_SESSION_KEY_ID=check \
+		PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+		PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+		PORTAL_STRIPE_SECRET_KEY=check \
+		PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+		PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+		docker compose --env-file /dev/null config -q 2>/dev/null; then \
+		echo "compose accepted a missing PORTAL_SESSION_KEY; the required-variable guard is not a guard"; \
+		exit 1; \
+	fi
 
 # Builds the container image with the revision stamped in, since the build
 # context deliberately excludes .git. A build from a modified worktree is
@@ -121,12 +140,20 @@ docker-build:
 	echo "building portal image at $$rev"; \
 	PORTAL_REVISION=$$rev docker compose build
 
-# The CI gate for the container: prove the Dockerfile builds from a clean
-# context. A digest bump or a Dockerfile edit that only fails at deploy time
-# is the kind of green-but-broken this repo exists to prevent — a FROM-line
-# comment did exactly that once, caught locally by luck.
+# The CI gate for the container. It builds THROUGH compose, not with a raw
+# docker build: compose is what production uses, and it is where the build
+# context and the PORTAL_REVISION build arg are wired. A raw build would prove
+# the Dockerfile compiles while leaving a broken compose build stanza to
+# surface at deploy time.
 docker-check:
-	docker build --build-arg PORTAL_REVISION=ci-check -q . >/dev/null
+	PORTAL_REVISION=ci-check \
+	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
+	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
+	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+	PORTAL_STRIPE_SECRET_KEY=check \
+	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
+	docker compose --env-file /dev/null build --quiet
 
 clean:
 	rm -rf bin

@@ -2,6 +2,7 @@ package checkout_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -73,9 +74,15 @@ func seedPerson(t *testing.T, pool *db.Pool) checkout.Person {
 	}
 	t.Cleanup(func() {
 		c := context.Background()
-		_, _ = pool.Conn().Exec(c, `DELETE FROM stripe_customers WHERE user_id = $1`, id)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM stripe_customer_creation_intents WHERE user_id = $1`, id)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM users WHERE id = $1`, id)
+		for _, statement := range []string{
+			`DELETE FROM stripe_customers WHERE user_id = $1`,
+			`DELETE FROM stripe_customer_creation_intents WHERE user_id = $1`,
+			`DELETE FROM users WHERE id = $1`,
+		} {
+			if _, err := pool.Conn().Exec(c, statement, id); err != nil {
+				t.Errorf("seedPerson cleanup failed (%s): %v", statement, err)
+			}
+		}
 	})
 	return checkout.Person{UserID: id, Email: sub + "@example.test", Name: "Checkout Member"}
 }
@@ -286,4 +293,40 @@ func TestConcurrentEnsureCustomerMintsExactlyOne(t *testing.T) {
 func mustPool(t *testing.T) *db.Pool {
 	t.Helper()
 	return testdb.Pool(t)
+}
+
+// The remote create failing outright, driven through EnsureCustomer rather
+// than hand-simulated. This wires up the fault injector that had sat unused
+// since it was written: an injected 500 must surface as an error with no
+// customer recorded, and — because Stripe caches a failure under its
+// idempotency key — the immediate retry must replay that cached failure
+// rather than appear to succeed. Recovery comes on the next attempt, once the
+// intent's metadata search can find nothing and the key has moved on.
+func TestFailedRemoteCreateRecordsNothing(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	fake.FailNextCustomerCreates(1)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+
+	if _, err := svc.EnsureCustomer(ctx, core.Memberships, person); err == nil {
+		t.Fatal("an injected remote failure was reported as success")
+	}
+	if fake.CustomerCount() != 0 {
+		t.Errorf("%d customers exist after a failed create", fake.CustomerCount())
+	}
+
+	// Nothing may be recorded locally: no customer projection, and the intent
+	// must still be unresolved so a later attempt reconciles rather than
+	// assumes.
+	if _, err := customers.New().CustomerIDFor(ctx, pool.Conn(), person.UserID, core.StripeProduction, core.Memberships); !errors.Is(err, db.ErrNotFound) {
+		t.Errorf("a customer projection survived a failed create: %v", err)
+	}
+	intent, err := customers.New().EnsureIntent(ctx, pool.Conn(), person.UserID, core.StripeProduction, core.Memberships, person.Email, person.Name)
+	if err != nil {
+		t.Fatalf("read intent: %v", err)
+	}
+	if intent.CustomerID != nil {
+		t.Errorf("the intent recorded %q despite the create failing", *intent.CustomerID)
+	}
 }

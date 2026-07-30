@@ -131,6 +131,32 @@ const (
 	stripeWrapperPkg = "internal/stripepay"
 )
 
+// The template rule's constants. A prefix match, so a future web/view/email
+// cannot slip out from under R4 by being a subpackage.
+const (
+	viewdataPkg     = "internal/web/viewdata"
+	viewdataPkgPath = modulePath + "/" + viewdataPkg
+
+	// templRuntime is the one third-party import templates may have: every
+	// generated _templ.go file requires it to render at all. It is the
+	// template engine, not a way to reach data, which is what R4 is about.
+	// Named explicitly rather than waved through, so a second exception has
+	// to be argued for here.
+	templRuntime = "github.com/a-h/templ"
+)
+
+func isTemplatePkg(local string) bool {
+	return local == "web/view" || strings.HasPrefix(local, "web/view/")
+}
+
+// isStdlib reports whether an import path belongs to the standard library.
+// Standard-library paths have no dot in their first element; every module
+// path does, because it starts with a hostname.
+func isStdlib(importPath string) bool {
+	first, _, _ := strings.Cut(importPath, "/")
+	return !strings.Contains(first, ".")
+}
+
 // anchorPkg must appear in every scan. Its absence means the tool was run
 // somewhere that cannot see the whole module, and a partial scan that passes
 // is worse than no scan.
@@ -223,6 +249,23 @@ func check(pkgs []pkg, layers map[string]int) []string {
 				}
 			}
 		}
+
+		// R4 is checked here, against raw import paths, for the same reason R5
+		// is: the layering loop below skips anything outside this module, so a
+		// template importing pgx or any other third-party package directly
+		// would never reach the rule. "Templates may import only viewdata"
+		// has to mean only viewdata, not only-viewdata-among-our-own-packages.
+		if isTemplatePkg(local) {
+			for _, imp := range p.Imports {
+				if imp == viewdataPkgPath || isStdlib(imp) ||
+					imp == templRuntime || strings.HasPrefix(imp, templRuntime+"/") {
+					continue
+				}
+				problems = append(problems, fmt.Sprintf(
+					"%s imports %s: templates may import only %s (and the standard library)",
+					local, imp, viewdataPkg))
+			}
+		}
 		from, known := layers[local]
 		if !known {
 			problems = append(problems, fmt.Sprintf(
@@ -257,15 +300,6 @@ func check(pkgs []pkg, layers map[string]int) []string {
 				problems = append(problems, fmt.Sprintf(
 					"%s imports %s: repositories must not import each other. Compose them in a service inside one db.WithTx.",
 					local, to))
-			}
-
-			// R4: templates see formatted data and nothing else. A prefix
-			// match, so a future web/view/email or web/view/pdf cannot slip
-			// out from under the rule by being a subpackage.
-			if (local == "web/view" || strings.HasPrefix(local, "web/view/")) &&
-				to != "internal/web/viewdata" {
-				problems = append(problems, fmt.Sprintf(
-					"%s imports %s: templates may import only internal/web/viewdata", local, to))
 			}
 		}
 	}

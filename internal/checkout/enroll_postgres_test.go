@@ -16,6 +16,7 @@ import (
 	"triplebit.org/portal/internal/repo/catalogdb"
 	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/stripetest"
+	"triplebit.org/portal/internal/testdb"
 )
 
 // seedTier inserts an active catalog item with a verified open price version
@@ -95,14 +96,11 @@ func seedTier(t *testing.T, pool *db.Pool, slug, kind string, recurring bool, st
 	return item
 }
 
+// cleanupOrders registers the order teardown. It must be registered AFTER the
+// user seed so it runs BEFORE it (cleanup is LIFO): orders reference users, so
+// the user cannot go first.
 func cleanupOrders(t *testing.T, pool *db.Pool, userID uuid.UUID) {
-	t.Cleanup(func() {
-		c := context.Background()
-		_, _ = pool.Conn().Exec(c, `DELETE FROM inventory_reservations WHERE order_line_id IN (SELECT id FROM order_lines WHERE order_id IN (SELECT id FROM orders WHERE user_id = $1))`, userID)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM order_state_history WHERE order_id IN (SELECT id FROM orders WHERE user_id = $1)`, userID)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM order_lines WHERE order_id IN (SELECT id FROM orders WHERE user_id = $1)`, userID)
-		_, _ = pool.Conn().Exec(c, `DELETE FROM orders WHERE user_id = $1`, userID)
-	})
+	t.Cleanup(func() { testdb.PurgeOrders(t, pool, userID) })
 }
 
 // enrollment is the BYOD shape: the member's own device, so an IMEI. A

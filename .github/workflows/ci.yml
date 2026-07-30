@@ -31,10 +31,15 @@ jobs:
   go:
     name: build, vet, test
     runs-on: ubuntu-latest
+    # A hung test or a stalled image pull must fail fast rather than occupy a
+    # runner until GitHub's default cap.
+    timeout-minutes: 20
 
     services:
       postgres:
-        image: postgres:17-alpine
+        # Digest-pinned like every other image in this project; the tag is
+        # what the digest resolved from.
+        image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 # 17-alpine
         env:
           POSTGRES_USER: portal
           POSTGRES_PASSWORD: portal
@@ -62,6 +67,8 @@ jobs:
     # version named in the trailing comment before being committed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -84,16 +91,28 @@ jobs:
         run: make lint-cookie
 
       # An enforcement mechanism that has never been observed to fail is not
-      # known to work. Plant a known-bad file and require the lint to catch it.
+      # known to work — and one observed to catch a single pattern is only
+      # known to catch that pattern. Every pattern the lint greps for gets its
+      # own probe.
       - name: the cookie lint can fail
         run: |
-          echo 'package httpx' > internal/httpx/zz_lint_probe.go
-          echo 'import "net/http"' >> internal/httpx/zz_lint_probe.go
-          echo 'func zzProbe(w http.ResponseWriter) { w.Header().Set("Set-Cookie", "x=1") }' >> internal/httpx/zz_lint_probe.go
-          if make lint-cookie; then
-            echo "lint-cookie passed a known-bad probe"; exit 1
-          fi
-          rm internal/httpx/zz_lint_probe.go
+          set -eu
+          probe() {
+            printf 'package httpx\n\nimport "net/http"\n\nvar _ = %s\n' "$1" \
+              > internal/httpx/zz_lint_probe.go
+            if make lint-cookie >/dev/null 2>&1; then
+              echo "lint-cookie passed a known-bad probe: $1"
+              rm -f internal/httpx/zz_lint_probe.go
+              exit 1
+            fi
+            rm -f internal/httpx/zz_lint_probe.go
+            echo "caught: $1"
+          }
+          probe 'func(w http.ResponseWriter) { w.Header().Set("Set-Cookie", "x=1") }'
+          probe 'func(w http.ResponseWriter) { http.SetCookie(w, nil) }'
+          probe 'http.Cookie{Name: "x"}'
+          probe '"__Host-x"'
+          make lint-cookie
 
       - name: module graph is verified and tidy
         run: make mod-verify

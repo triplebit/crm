@@ -214,6 +214,16 @@ func TestOnlyOneLiveConsentPerVersionButHistoryIsKept(t *testing.T) {
 	pool := testdb.Pool(t)
 
 	userID := seedUser(t, ctx, pool)
+	// Registered after seedUser so it runs before it: consents reference
+	// users with no ON DELETE clause, so the user delete fails while any
+	// consent survives — which is how this test used to leak a user and two
+	// consents into the shared database on every run.
+	t.Cleanup(func() {
+		if _, err := pool.Conn().Exec(context.Background(),
+			`DELETE FROM consents WHERE user_id = $1`, userID); err != nil {
+			t.Errorf("consent cleanup failed: %v", err)
+		}
+	})
 
 	insert := func(id uuid.UUID) error {
 		_, err := pool.Conn().Exec(ctx, `
@@ -329,7 +339,10 @@ func seedUser(t *testing.T, ctx context.Context, pool *db.Pool) uuid.UUID {
 		t.Fatalf("seed user: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Conn().Exec(context.Background(), `DELETE FROM users WHERE id = $1`, id)
+		if _, err := pool.Conn().Exec(context.Background(),
+			`DELETE FROM users WHERE id = $1`, id); err != nil {
+			t.Errorf("seedUser cleanup failed, leaking a row: %v", err)
+		}
 	})
 	return id
 }
@@ -400,5 +413,128 @@ func TestCiphertextColumnsEnforceEnvelopesAndSupportRotationSelection(t *testing
 	}
 	if stale != 1 {
 		t.Errorf("rotation selection found %d stale rows, want exactly the pii-v1 one", stale)
+	}
+}
+
+// The other two append-only tables. Only audit_events had a deliberate test;
+// order_lines and order_state_history were exercised solely by accident, by a
+// broken teardown that asserted nothing about being refused. These are the
+// frozen-order-lines invariant from the roadmap's cannot-be-cut list, so the
+// enforcement deserves to be watched failing.
+//
+// TRUNCATE is deliberately not covered: row-level triggers do not fire on it,
+// and the defence there is role separation — the migrate credential owns the
+// tables, the serve and worker credentials do not, so the application cannot
+// issue TRUNCATE at all. A trigger would duplicate a control that belongs to
+// the grant.
+func TestOrderLinesAndStateHistoryAreAppendOnly(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	userID := seedUser(t, ctx, pool)
+	orderID := uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO orders (id, user_id, program, environment, account_ref, state,
+		                    currency, idempotency_key)
+		VALUES ($1, $2, 'hotspot', 'sandbox', 'memberships', 'checkout_pending', 'usd', $3)
+	`, orderID, userID, orderID.String()); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	t.Cleanup(func() { testdb.PurgeOrders(t, pool, userID) })
+
+	lineID := uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO order_lines (id, order_id, line_number, kind, slug, name,
+		                         amount, currency, quantity, account_ref)
+		VALUES ($1, $2, 1, 'hotspot_tier', 'test-slug', 'Test line',
+		        7500, 'usd', 1, 'memberships')
+	`, lineID, orderID); err != nil {
+		t.Fatalf("seed line: %v", err)
+	}
+	historyID := uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO order_state_history (id, order_id, from_state, to_state, reason, source)
+		VALUES ($1, $2, NULL, 'checkout_pending', 'test', 'member')
+	`, historyID, orderID); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, statement string
+		arg             uuid.UUID
+	}{
+		{"order line update", `UPDATE order_lines SET amount = 1 WHERE id = $1`, lineID},
+		{"order line delete", `DELETE FROM order_lines WHERE id = $1`, lineID},
+		{"state history update", `UPDATE order_state_history SET reason = 'x' WHERE id = $1`, historyID},
+		{"state history delete", `DELETE FROM order_state_history WHERE id = $1`, historyID},
+	} {
+		if _, err := pool.Conn().Exec(ctx, tc.statement, tc.arg); err == nil {
+			t.Errorf("%s succeeded; what was sold and how it got there must be immutable", tc.name)
+		}
+	}
+
+	// Both rows must survive, since none of those statements may have run.
+	var lines, history int
+	if err := pool.Conn().QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM order_lines WHERE id = $1),
+		       (SELECT count(*) FROM order_state_history WHERE id = $2)
+	`, lineID, historyID).Scan(&lines, &history); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if lines != 1 || history != 1 {
+		t.Errorf("survivors: %d lines, %d history rows; want 1 and 1", lines, history)
+	}
+}
+
+// Migration 000003's preflight refuses to convert ciphertext columns when any
+// hold data, because the conversion is USING NULL and would erase them. The
+// guard existing and the guard working are different claims: this runs the
+// migration's own DO block, read out of the embedded migration itself, against
+// a row that must trip it.
+func TestMigration000003PreflightRefusesToDestroyCiphertext(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	var preflight string
+	for _, m := range all {
+		if !strings.Contains(m.Name, "pii_envelopes") {
+			continue
+		}
+		start := strings.Index(m.SQL, "DO $$")
+		end := strings.Index(m.SQL, "END $$;")
+		if start < 0 || end < 0 {
+			t.Fatal("migration 000003 no longer contains a DO-block preflight; this test is now lying")
+		}
+		preflight = m.SQL[start : end+len("END $$;")]
+	}
+	if preflight == "" {
+		t.Fatal("migration 000003 was not found")
+	}
+
+	// Only refusal is asserted, not acceptance: sibling tests legitimately
+	// hold ciphertext in this shared database at the same moment, so "the
+	// guard passes on a clean database" is not a property one test can claim.
+	userID := seedUser(t, ctx, pool)
+	orderID := uuid.New()
+	if _, err := pool.Conn().Exec(ctx, `
+		INSERT INTO orders (id, user_id, program, environment, account_ref, state,
+		                    currency, imei_ciphertext, idempotency_key)
+		VALUES ($1, $2, 'hotspot', 'sandbox', 'memberships', 'checkout_pending', 'usd',
+		        'v1.pii-v1.AAAA', $3)
+	`, orderID, userID, orderID.String()); err != nil {
+		t.Fatalf("seed ciphertext: %v", err)
+	}
+	t.Cleanup(func() { testdb.PurgeOrders(t, pool, userID) })
+
+	_, err = pool.Conn().Exec(ctx, preflight)
+	if err == nil {
+		t.Fatal("the preflight accepted a database holding ciphertext it would have erased")
+	}
+	if !strings.Contains(err.Error(), "unwritten") {
+		t.Errorf("error %q does not explain the precondition", err)
 	}
 }
