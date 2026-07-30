@@ -2,21 +2,46 @@
   "items": [
     {
       "slug": "hotspot-annual",
-      "name": "Hotspot Membership — Annual",
+      "name": "Hotspot Membership \u2014 Annual",
       "kind": "hotspot_tier",
-      "price": {"amount": "400.00", "currency": "usd", "recurring": true, "interval": "year"}
+      "price": {
+        "amount": "400.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "year"
+      },
+      "requires_shipping": true,
+      "requires_imei": true,
+      "inventory_tracked": true
     },
     {
       "slug": "hotspot-quarterly",
-      "name": "Hotspot Membership — Quarterly",
+      "name": "Hotspot Membership \u2014 Quarterly",
       "kind": "hotspot_tier",
-      "price": {"amount": "150.00", "currency": "usd", "recurring": true, "interval": "month", "interval_count": 3}
+      "price": {
+        "amount": "150.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month",
+        "interval_count": 3
+      },
+      "requires_shipping": true,
+      "requires_imei": true,
+      "inventory_tracked": true
     },
     {
       "slug": "hotspot-monthly",
-      "name": "Hotspot Membership — Monthly",
+      "name": "Hotspot Membership \u2014 Monthly",
       "kind": "hotspot_tier",
-      "price": {"amount": "75.00", "currency": "usd", "recurring": true, "interval": "month"}
+      "price": {
+        "amount": "75.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month"
+      },
+      "requires_shipping": true,
+      "requires_imei": true,
+      "inventory_tracked": true
     },
     {
       "slug": "hotspot-device",
@@ -25,31 +50,54 @@
       "requires_shipping": true,
       "requires_imei": true,
       "inventory_tracked": true,
-      "price": {"amount": "100.00", "currency": "usd"}
+      "price": {
+        "amount": "100.00",
+        "currency": "usd"
+      }
     },
     {
       "slug": "friends-5",
-      "name": "Friends of Triplebit — $5 monthly",
+      "name": "Friends of Triplebit \u2014 $5 monthly",
       "kind": "friends_tier",
-      "price": {"amount": "5.00", "currency": "usd", "recurring": true, "interval": "month"}
+      "price": {
+        "amount": "5.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month"
+      }
     },
     {
       "slug": "friends-10",
-      "name": "Friends of Triplebit — $10 monthly",
+      "name": "Friends of Triplebit \u2014 $10 monthly",
       "kind": "friends_tier",
-      "price": {"amount": "10.00", "currency": "usd", "recurring": true, "interval": "month"}
+      "price": {
+        "amount": "10.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month"
+      }
     },
     {
       "slug": "friends-25",
-      "name": "Friends of Triplebit — $25 monthly",
+      "name": "Friends of Triplebit \u2014 $25 monthly",
       "kind": "friends_tier",
-      "price": {"amount": "25.00", "currency": "usd", "recurring": true, "interval": "month"}
+      "price": {
+        "amount": "25.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month"
+      }
     },
     {
       "slug": "friends-50",
-      "name": "Friends of Triplebit — $50 monthly",
+      "name": "Friends of Triplebit \u2014 $50 monthly",
       "kind": "friends_tier",
-      "price": {"amount": "50.00", "currency": "usd", "recurring": true, "interval": "month"}
+      "price": {
+        "amount": "50.00",
+        "currency": "usd",
+        "recurring": true,
+        "interval": "month"
+      }
     }
   ]
 }
