@@ -117,6 +117,9 @@ func (s *Service) StartFriends(ctx context.Context, person Person, req FriendsRe
 	if err := s.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
 		return s.orders.CreatePending(ctx, c, order, []orders.Line{line})
 	}); err != nil {
+		if url, ok, resumeErr := s.resumeAfterRace(ctx, person, "friends", err); ok || resumeErr != nil {
+			return url, resumeErr
+		}
 		return "", err
 	}
 

@@ -82,6 +82,17 @@ func (s *Server) post(pattern string, h handler) {
 	}, h)
 }
 
+// postLimited is post plus the rate limiter, for routes whose handler calls
+// Stripe. Stripe's own idempotency stops duplicate charges, but one member
+// hammering checkout would still spend the organization's shared API quota
+// and degrade every other member's checkout.
+func (s *Server) postLimited(pattern string, h handler) {
+	s.register(route{
+		Method: http.MethodPost, Pattern: pattern,
+		RequiresSession: true, ValidatesCSRF: true, RateLimited: true,
+	}, h)
+}
+
 func (s *Server) register(rt route, h handler) {
 	// Impossible combinations are refused at startup, not discovered at
 	// request time: CSRF validation reads the session's secret, so without a
@@ -100,7 +111,11 @@ func (s *Server) register(rt route, h handler) {
 	s.mux.HandleFunc(rt.Method+" "+rt.Pattern, func(w http.ResponseWriter, r *http.Request) {
 		c := &reqctx{w: w, r: r, s: s}
 
-		if rt.RateLimited {
+		// The limiter runs before the session load for unauthenticated
+		// routes, so fabricated cookies cannot buy database lookups. Routes
+		// that require a session are limited per member instead, below, since
+		// several members can share one NAT address.
+		if rt.RateLimited && !rt.RequiresSession {
 			allowed, retryAfter := s.authLimiter.Allow(httpx.ClientIP(r, s.trustProxy))
 			if !allowed {
 				httpx.WriteRateLimitExceeded(w, retryAfter)
@@ -146,6 +161,14 @@ func (s *Server) register(rt route, h handler) {
 				http.Error(w, "Sign in to do that.", http.StatusForbidden)
 			}
 			return
+		}
+
+		if rt.RateLimited && rt.RequiresSession {
+			allowed, retryAfter := s.authLimiter.Allow("user:" + c.principal.User.ID.String())
+			if !allowed {
+				httpx.WriteRateLimitExceeded(w, retryAfter)
+				return
+			}
 		}
 
 		if rt.ValidatesCSRF {

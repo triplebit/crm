@@ -267,13 +267,14 @@ func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored cat
 	// converges; a wedged sync does not.
 	nameSum := sha256.Sum256([]byte(item.Name))
 	product, err := s.pay.CreateProduct(ctx, account,
-		fmt.Sprintf("catsync:product:%s:%s:%s", s.env.String(), item.Slug, hex.EncodeToString(nameSum[:8])),
+		fmt.Sprintf("catsync:product:%s:%s:%s:%s",
+			s.env.String(), account.String(), item.Slug, hex.EncodeToString(nameSum[:8])),
 		stripepay.ProductSpec{Name: item.Name, Slug: item.Slug})
 	if err != nil {
 		return err
 	}
 	price, err := s.pay.CreatePrice(ctx, account,
-		priceIdempotencyKey(s.env, item.Slug, item.Price, product.ID, "none"),
+		priceIdempotencyKey(s.env, account, item.Slug, item.Price, product.ID, "none"),
 		priceSpec(product.ID, item))
 	if err != nil {
 		return err
@@ -288,7 +289,7 @@ func (s *Syncer) create(ctx context.Context, account core.AccountRef, stored cat
 // rotate replaces the current price with the manifest's.
 func (s *Syncer) rotate(ctx context.Context, account core.AccountRef, stored catalogdb.Item, current catalogdb.PriceVersion, item catalog.Item) error {
 	price, err := s.pay.CreatePrice(ctx, account,
-		priceIdempotencyKey(s.env, item.Slug, item.Price, current.ProductID, current.PriceID),
+		priceIdempotencyKey(s.env, account, item.Slug, item.Price, current.ProductID, current.PriceID),
 		priceSpec(current.ProductID, item))
 	if err != nil {
 		return err
@@ -424,9 +425,9 @@ func deactivationKey(priceID string) string {
 // hard way: a key that omits a parameter wedges with idempotency_error the
 // first time that parameter diverges, which a local-database rebuild against
 // a remembering Stripe demonstrated in practice.
-func priceIdempotencyKey(env core.StripeEnvironment, slug string, spec catalog.PriceSpec, productID, previousPriceID string) string {
-	content := fmt.Sprintf("%s|%s|%d|%s|%t|%s|%d|%s|%s",
-		env.String(), slug, spec.Amount, spec.Currency,
+func priceIdempotencyKey(env core.StripeEnvironment, account core.AccountRef, slug string, spec catalog.PriceSpec, productID, previousPriceID string) string {
+	content := fmt.Sprintf("%s|%s|%s|%d|%s|%t|%s|%d|%s|%s",
+		env.String(), account.String(), slug, spec.Amount, spec.Currency,
 		spec.Recurring, spec.Interval, spec.IntervalCount, productID, previousPriceID)
 	sum := sha256.Sum256([]byte(content))
 	return "catsync:price:" + slug + ":" + hex.EncodeToString(sum[:16])

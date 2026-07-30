@@ -88,3 +88,30 @@ no variant lacking them; impossible flag combinations panic at startup.
 **Consequence.** Tests iterate the route registry, so every future mutating
 route is covered the moment it compiles. `router.Webhook` will be the single
 greppable exception when M6 needs it; until then no exception exists.
+
+## D9 — the portal stores no shipping addresses
+
+**Context.** Stripe collects the shipping address on the hosted Checkout page
+and keeps it on the settled session indefinitely. The worker is deliberately
+denied the PII key (D7), so a design where the worker projected addresses into
+`orders.shipping_address_ciphertext` would have forced either weakening that
+boundary or building an encrypt-only mechanism — the symmetric AES-GCM keyring
+cannot encrypt without also being able to decrypt. **Decision.** Do not store
+shipping addresses at all. Stripe is the system of record; staff read the
+address from Stripe at the moment they print a label. **Consequence.** The
+portal holds zero home addresses: nothing to encrypt, rotate, sweep, or leak,
+and D7's boundary needs no revision. `orders.shipping_address_ciphertext` is
+never written and can be dropped in M8. The cost is one Stripe read on the
+staff fulfillment page, which is already loading that order.
+
+## D10 — order-field PII goes through cryptox.PII, never a local AAD
+
+**Context.** M5's first draft sealed the IMEI with a private `orderAAD` helper
+inside `internal/checkout`, duplicating a record/field codec that
+`internal/cryptox` already provided — and leaving M7 (staff reads) and M8
+(rotation) unable to open those envelopes without copying the format.
+**Decision.** Every order-field ciphertext uses `cryptox.PII`, whose associated
+data binds record id and field name. **Consequence.** One codec, in the lowest
+layer that can hold it; the private helper is deleted. Copying an envelope
+between orders or between fields still fails authentication, which was the
+original point.

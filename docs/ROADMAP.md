@@ -163,6 +163,24 @@ where a staff page shows it. A dead-letter queue nobody watches is not a
 control, and the schema's decision to defer the reconciliation sweeper leans
 on this queue being watched.
 
+Two settlement designs land with this milestone's migration, both found by
+review of M5:
+
+- **A custom Friends subscription has no catalog price version to anchor**
+  (the member set the amount), yet `memberships.tier_price_version_id` is
+  `NOT NULL`. Migration 000004 adds a source-order-line reference and relaxes
+  that column to null *only* for the custom-Friends case, with CHECK
+  constraints making every other null combination impossible. The immutable
+  order line is the anchor — a synthesized "current custom price" catalog item
+  would collide with the catalog's single-open-version invariant the moment
+  two members chose different amounts.
+- **Nothing releases an inventory reservation.** The schema anticipated this
+  (a four-state enum and a partial index on `expires_at WHERE state = 'held'`,
+  both unread by any code) but the roadmap never named it, which is why it is
+  named here now. The member path already abandons its own stale order; the
+  worker sweep is this milestone's, against that index. Until it exists, every
+  abandoned device enrolment permanently consumes stock.
+
 Design to settle before M6's migration (batched as one): the webhook inbox
 needs the same lease columns `outbox_jobs` already has (a worker that dies
 mid-flight must not strand a paid order), `FOR UPDATE SKIP LOCKED` becomes the

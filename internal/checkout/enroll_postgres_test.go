@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -307,4 +308,119 @@ func TestStartEnrollmentValidation(t *testing.T) {
 	if fake.SessionCount() != 0 {
 		t.Error("validation failures reached Stripe")
 	}
+}
+
+// A pending order past the reservation window must not be resurrected: past
+// Stripe's idempotency retention a replay mints a genuinely new payable
+// session, and the stock behind the old one is already going back. The member
+// gets a fresh order; the abandoned one releases its hold.
+func TestStaleOrderIsAbandonedRatherThanResumed(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	device := seedTier(t, pool, "hotspot-device", "device", false, 5)
+	cleanupOrders(t, pool, person.UserID)
+
+	req := enrollment(tier.Slug)
+	req.IncludeDevice = true
+	req.IMEI = ""
+	if _, err := svc.StartEnrollment(ctx, person, req); err != nil {
+		t.Fatalf("first StartEnrollment: %v", err)
+	}
+	reservedBefore := reservedCount(t, pool, device.ID)
+	if reservedBefore != 1 {
+		t.Fatalf("reserved = %d after enrolling, want 1", reservedBefore)
+	}
+
+	// Well past the resume window.
+	svc.SetClockForTest(func() time.Time { return time.Now().Add(30 * time.Hour) })
+	if _, err := svc.StartEnrollment(ctx, person, req); err != nil {
+		t.Fatalf("StartEnrollment after the window: %v", err)
+	}
+
+	var expired, pending int
+	if err := pool.Conn().QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE state = 'expired'),
+		       count(*) FILTER (WHERE state = 'checkout_pending')
+		FROM orders WHERE user_id = $1
+	`, person.UserID).Scan(&expired, &pending); err != nil {
+		t.Fatalf("count orders: %v", err)
+	}
+	if expired != 1 || pending != 1 {
+		t.Errorf("orders: %d expired, %d pending; want 1 and 1 — the stale one abandoned, a fresh one created", expired, pending)
+	}
+	// The abandoned order's hold went back, and the new order took its own.
+	if got := reservedCount(t, pool, device.ID); got != 1 {
+		t.Errorf("reserved = %d, want 1: the stale hold must be released as the new one is taken", got)
+	}
+	var released int
+	if err := pool.Conn().QueryRow(ctx, `
+		SELECT count(*) FROM inventory_reservations r
+		JOIN order_lines l ON l.id = r.order_line_id
+		JOIN orders o ON o.id = l.order_id
+		WHERE o.user_id = $1 AND r.state = 'released'
+	`, person.UserID).Scan(&released); err != nil {
+		t.Fatalf("count released: %v", err)
+	}
+	if released != 1 {
+		t.Errorf("%d released reservations, want 1", released)
+	}
+}
+
+// Two submissions racing past the pending-order check: the loser must be
+// handed the winner's Checkout page, not a 500.
+func TestConcurrentSubmissionsResumeTheWinner(t *testing.T) {
+	ctx := context.Background()
+	fake := stripetest.New(t)
+	svc, pool := newService(t, fake)
+	person := seedPerson(t, pool)
+	tier := seedTier(t, pool, "tier-"+uuid.New().String()[:8], "hotspot_tier", true, -1)
+	cleanupOrders(t, pool, person.UserID)
+
+	const attempts = 4
+	urls := make([]string, attempts)
+	errs := make([]error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			urls[i], errs[i] = svc.StartEnrollment(ctx, person, enrollment(tier.Slug))
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("attempt %d failed: %v", i, err)
+		}
+	}
+	for i := 1; i < attempts; i++ {
+		if urls[i] != urls[0] {
+			t.Errorf("attempt %d got %q, attempt 0 got %q: a double-click must land on one page", i, urls[i], urls[0])
+		}
+	}
+	var orders int
+	if err := pool.Conn().QueryRow(ctx,
+		`SELECT count(*) FROM orders WHERE user_id = $1`, person.UserID).Scan(&orders); err != nil {
+		t.Fatalf("count orders: %v", err)
+	}
+	if orders != 1 {
+		t.Errorf("%d orders, want exactly 1", orders)
+	}
+	if fake.SessionCount() != 1 {
+		t.Errorf("%d sessions, want exactly 1", fake.SessionCount())
+	}
+}
+
+func reservedCount(t *testing.T, pool *db.Pool, itemID uuid.UUID) int {
+	t.Helper()
+	var reserved int
+	if err := pool.Conn().QueryRow(context.Background(),
+		`SELECT reserved FROM inventory WHERE catalog_item_id = $1`, itemID).Scan(&reserved); err != nil {
+		t.Fatalf("read reserved: %v", err)
+	}
+	return reserved
 }

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +40,8 @@ type Server struct {
 
 	server    *httptest.Server
 	byIdem    map[string]map[string]any
-	byIdemErr map[string]int // idempotency key → cached error status
+	byIdemSig map[string]string // idempotency key → canonical request signature
+	byIdemErr map[string]int    // idempotency key → cached error status
 	prices    map[string]map[string]any
 	products  map[string]map[string]any
 
@@ -65,6 +67,7 @@ func New(t *testing.T) *Server {
 	f := &Server{
 		prefix:         hex.EncodeToString(raw),
 		byIdem:         map[string]map[string]any{},
+		byIdemSig:      map[string]string{},
 		byIdemErr:      map[string]int{},
 		prices:         map[string]map[string]any{},
 		products:       map[string]map[string]any{},
@@ -196,10 +199,28 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	// Stripe caches a request's result under its idempotency key REGARDLESS
 	// of whether it succeeded — a replayed key returns the cached response,
-	// errors included. Modelling that here is what makes "retry with the
-	// same key" tests honest: production would replay a cached 500, so the
-	// fake does too.
-	if idem := r.Header.Get("Idempotency-Key"); idem != "" && r.Method == http.MethodPost {
+	// errors included — and it REFUSES a replay whose parameters differ.
+	// Both behaviours are modelled, because a fake that replays regardless of
+	// parameters cannot tell a genuinely idempotent retry from a changed
+	// request wearing an old key: the crash-recovery tests would pass either
+	// way, which is the same as not testing them.
+	// Keys are scoped per account, as Stripe scopes them: the same key in two
+	// accounts is two independent requests.
+	idem := r.Header.Get("Idempotency-Key")
+	if idem != "" {
+		idem = context + "|" + idem
+	}
+	signature := canonicalSignature(r, context)
+	if idem != "" && r.Method == http.MethodPost {
+		if prior, ok := f.byIdemSig[idem]; ok && prior != signature {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+				"type": "idempotency_error",
+				"message": "Keys for idempotent requests can only be used with the same parameters " +
+					"they were first used with.",
+			}})
+			return
+		}
 		if status, ok := f.byIdemErr[idem]; ok {
 			http.Error(w, `{"error":{"message":"cached error replayed for idempotency key"}}`, status)
 			return
@@ -208,6 +229,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			respond(prior)
 			return
 		}
+		f.byIdemSig[idem] = signature
 	}
 
 	failInjected := func(counter *int, idem string) bool {
@@ -231,7 +253,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"metadata": map[string]any{"portal_slug": r.PostForm.Get("metadata[portal_slug]")},
 		}
 		f.products[obj["id"].(string)] = obj
-		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
+		f.byIdem[idem] = obj
 		respond(obj)
 
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/products/"):
@@ -270,7 +292,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			obj["recurring"] = map[string]any{"interval": interval, "interval_count": count}
 		}
 		f.prices[obj["id"].(string)] = obj
-		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
+		f.byIdem[idem] = obj
 		respond(obj)
 
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/prices/"):
@@ -280,7 +302,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.PostForm.Get("active") == "false" {
-			if failInjected(&f.failDeactivate, r.Header.Get("Idempotency-Key")) {
+			if failInjected(&f.failDeactivate, idem) {
 				return
 			}
 			obj["active"] = false
@@ -296,7 +318,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		notFound(w, "price")
 
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/customers":
-		if failInjected(&f.failCustCreates, r.Header.Get("Idempotency-Key")) {
+		if failInjected(&f.failCustCreates, idem) {
 			return
 		}
 		f.creates++
@@ -308,7 +330,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 		id := obj["id"].(string)
 		f.customers[id] = obj
 		f.customerOrigin[id] = context
-		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
+		f.byIdem[idem] = obj
 		respond(obj)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/checkout/sessions":
@@ -324,7 +346,7 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"expires_at":           1900000000,
 		}
 		f.sessions[id] = obj
-		f.byIdem[r.Header.Get("Idempotency-Key")] = obj
+		f.byIdem[idem] = obj
 		respond(obj)
 
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/customers/search":
@@ -368,4 +390,21 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, `{"error":{"message":"unexpected `+r.Method+` `+r.URL.Path+`"}}`, http.StatusBadRequest)
 	}
+}
+
+// canonicalSignature is what Stripe compares on idempotency-key reuse: the
+// account context, the endpoint, and every form parameter, in a stable order.
+func canonicalSignature(r *http.Request, stripeContext string) string {
+	keys := make([]string, 0, len(r.PostForm))
+	for k := range r.PostForm {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := []string{stripeContext, r.Method, r.URL.Path}
+	for _, k := range keys {
+		values := append([]string(nil), r.PostForm[k]...)
+		sort.Strings(values)
+		parts = append(parts, k+"="+strings.Join(values, ","))
+	}
+	return strings.Join(parts, "|")
 }

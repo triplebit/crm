@@ -36,12 +36,18 @@ type Order struct {
 	State       string
 	Currency    string
 
-	IMEICiphertext            string
-	ShippingAddressCiphertext string
+	// IMEICiphertext is a cryptox.PII envelope. There is deliberately no
+	// shipping-address field: Stripe holds addresses, the portal does not.
+	IMEICiphertext string
 
 	CheckoutSessionID    string
 	CheckoutURLExpiresAt *time.Time
 	IdempotencyKey       string
+
+	// CreatedAt bounds how long a pending order may be resumed: past the
+	// inventory hold window it is stale, and resurrecting it could hand out a
+	// payable Checkout page with no stock behind it.
+	CreatedAt time.Time
 }
 
 // Line is one frozen order line.
@@ -70,12 +76,10 @@ type Line struct {
 func (r *Repo) CreatePending(ctx context.Context, q db.Conn, o Order, lines []Line) error {
 	_, err := q.Exec(ctx, `
 		INSERT INTO orders (id, user_id, program, environment, account_ref, state,
-		                    currency, imei_ciphertext, shipping_address_ciphertext,
-		                    idempotency_key)
-		VALUES ($1, $2, $3, $4, $5, 'checkout_pending', $6,
-		        NULLIF($7, ''), NULLIF($8, ''), $9)
+		                    currency, imei_ciphertext, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, 'checkout_pending', $6, NULLIF($7, ''), $8)
 	`, o.ID, o.UserID, o.Program, o.Environment.String(), o.Account.String(),
-		o.Currency, o.IMEICiphertext, o.ShippingAddressCiphertext, o.IdempotencyKey)
+		o.Currency, o.IMEICiphertext, o.IdempotencyKey)
 	if err != nil {
 		return fmt.Errorf("orders: create order: %w", db.Normalize(err))
 	}
@@ -158,14 +162,14 @@ func (r *Repo) PendingForUser(ctx context.Context, q db.Conn, userID uuid.UUID, 
 	var sessionID *string
 	err := q.QueryRow(ctx, `
 		SELECT id, user_id, program, account_ref, state, currency,
-		       COALESCE(imei_ciphertext, ''), COALESCE(shipping_address_ciphertext, ''),
+		       COALESCE(imei_ciphertext, ''), created_at,
 		       stripe_checkout_session_id, checkout_url_expires_at, idempotency_key
 		FROM orders
 		WHERE user_id = $1 AND program = $2 AND environment = $3
 		  AND state = 'checkout_pending'
 	`, userID, program, env.String()).Scan(
 		&o.ID, &o.UserID, &o.Program, &account, &o.State, &o.Currency,
-		&o.IMEICiphertext, &o.ShippingAddressCiphertext,
+		&o.IMEICiphertext, &o.CreatedAt,
 		&sessionID, &o.CheckoutURLExpiresAt, &o.IdempotencyKey,
 	)
 	if err != nil {
@@ -230,4 +234,48 @@ func nullUUID(id uuid.UUID) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// Abandon marks a pending order expired and releases every hold it took, in
+// one statement each so the two can never disagree. It is the member-path
+// half of reservation recovery; the worker sweep (M6) is the other, and both
+// are idempotent: an order already out of checkout_pending affects no rows.
+func (r *Repo) Abandon(ctx context.Context, q db.Conn, orderID uuid.UUID, at time.Time, reason string) (bool, error) {
+	tag, err := q.Exec(ctx, `
+		UPDATE orders SET state = 'expired', updated_at = now()
+		WHERE id = $1 AND state = 'checkout_pending'
+	`, orderID)
+	if err != nil {
+		return false, fmt.Errorf("orders: abandon %s: %w", orderID, db.Normalize(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	// Give the stock back before marking the reservation released, so a crash
+	// between the two leaves stock reserved rather than double-issued: the
+	// safe direction.
+	if _, err := q.Exec(ctx, `
+		UPDATE inventory i SET reserved = i.reserved - r.quantity, updated_at = now()
+		FROM inventory_reservations r
+		JOIN order_lines l ON l.id = r.order_line_id
+		WHERE r.inventory_id = i.id AND l.order_id = $1 AND r.state = 'held'
+	`, orderID); err != nil {
+		return false, fmt.Errorf("orders: release stock for %s: %w", orderID, db.Normalize(err))
+	}
+	if _, err := q.Exec(ctx, `
+		UPDATE inventory_reservations r
+		SET state = 'released', released_at = $2, updated_at = now()
+		FROM order_lines l
+		WHERE l.id = r.order_line_id AND l.order_id = $1 AND r.state = 'held'
+	`, orderID, at); err != nil {
+		return false, fmt.Errorf("orders: release reservations for %s: %w", orderID, db.Normalize(err))
+	}
+	if _, err := q.Exec(ctx, `
+		INSERT INTO order_state_history (id, order_id, from_state, to_state, reason, source)
+		VALUES ($1, $2, 'checkout_pending', 'expired', $3, 'system')
+	`, uuid.New(), orderID, reason); err != nil {
+		return false, fmt.Errorf("orders: record abandonment: %w", db.Normalize(err))
+	}
+	return true, nil
 }

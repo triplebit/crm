@@ -26,9 +26,9 @@ func (s *Server) registerRoutes() {
 	s.getLimited("/auth/callback", s.callback)
 	s.getAuthed("/account", s.account)
 	s.getAuthed("/enroll", s.enrollForm)
-	s.post("/enroll", s.enrollSubmit)
+	s.postLimited("/enroll", s.enrollSubmit)
 	s.getAuthed("/give", s.giveForm)
-	s.post("/give", s.giveSubmit)
+	s.postLimited("/give", s.giveSubmit)
 	s.post("/logout", s.logout)
 }
 

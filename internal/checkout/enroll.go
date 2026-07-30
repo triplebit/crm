@@ -36,6 +36,12 @@ import (
 const (
 	sessionLifetime  = 24 * time.Hour
 	reservationGrace = 1 * time.Hour
+
+	// resumeWindow is how long a pending order may be resumed. It is shorter
+	// than the hold (sessionLifetime + reservationGrace) so a resumed page can
+	// never outlive the stock behind it, and shorter than Stripe's ~24-hour
+	// idempotency retention so a resume replays rather than re-creates.
+	resumeWindow = 20 * time.Hour
 )
 
 var imeiPattern = regexp.MustCompile(`^[0-9]{14,16}$`)
@@ -55,11 +61,20 @@ type EnrollmentRequest struct {
 	IMEI string
 }
 
-// The shipping address is deliberately absent from this struct. Stripe
-// collects it on the hosted page — it validates and autocompletes, and the
-// address then arrives on the settled session, so the portal never stores a
-// shipping address for an order nobody paid for. It is projected onto the
-// order by M6's webhook, alongside every other settled fact.
+// The shipping address is absent from this struct, and from the database.
+//
+// Stripe collects it on the hosted page and keeps it on the settled session
+// indefinitely, which makes Stripe the system of record. The portal therefore
+// stores no home addresses at all: staff read the address from Stripe at the
+// moment they print a label (M7), and there is nothing here to encrypt,
+// rotate, sweep, leak, or hand to the worker. That last point resolves a real
+// tension — the worker is deliberately denied the PII key (D7), so a design
+// where it projected addresses would have forced either weakening that
+// boundary or building an encrypt-only mechanism. Not storing the address is
+// smaller than both and strictly more private.
+//
+// orders.shipping_address_ciphertext is consequently never written; M8 can
+// drop the column.
 
 // StartEnrollment turns a choice into a Stripe Checkout URL, crash-safe at
 // every step:
@@ -115,7 +130,7 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 	imeiSealed := ""
 	if !req.IncludeDevice {
 		imei := strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")
-		imeiSealed, err = s.keys.Encrypt([]byte(imei), orderAAD(orderID, "imei"))
+		imeiSealed, err = s.pii.Encrypt(orderID.String(), "imei", []byte(imei))
 		if err != nil {
 			return "", fmt.Errorf("checkout: seal imei: %w", err)
 		}
@@ -134,8 +149,6 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		Account:        core.Memberships,
 		Currency:       tierVersion.Currency,
 		IMEICiphertext: imeiSealed,
-		// shipping_address_ciphertext stays NULL until M6 projects what
-		// Stripe collected on the hosted page.
 		IdempotencyKey: "order:" + orderID.String(),
 	}
 
@@ -183,6 +196,12 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 			return "", safeerr.WithStatus(http.StatusConflict,
 				"That item is out of stock right now. Please try again later.")
 		}
+		// Two submissions raced past the pending-order check and this one lost
+		// the unique index. The winner's order is the answer — which is what a
+		// double-click should get, rather than a 500.
+		if url, ok, resumeErr := s.resumeAfterRace(ctx, person, "hotspot", err); ok || resumeErr != nil {
+			return url, resumeErr
+		}
 		return "", err
 	}
 
@@ -198,6 +217,21 @@ func (s *Service) resumePending(ctx context.Context, person Person, program stri
 		return "", false, nil
 	case err != nil:
 		return "", false, err
+	}
+
+	// A stale pending order must not be resurrected. Replaying its
+	// idempotency key normally returns the original Session with its original
+	// expiry — but Stripe prunes idempotency records after about a day, and a
+	// replay past that mints a genuinely new, payable 24-hour Session while
+	// this order's inventory hold is already expiring. Rather than chase the
+	// hold forward, abandon the order: the member gets a fresh one at current
+	// prices, and the stock goes back.
+	if s.now().UTC().After(pending.CreatedAt.Add(resumeWindow)) {
+		if _, err := s.orders.Abandon(ctx, s.pool.Conn(), pending.ID, s.now().UTC(),
+			"checkout not completed within the reservation window"); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
 	}
 
 	// A still-valid session: hand back its page. The URL is not stored (it
@@ -305,12 +339,6 @@ func itemAccount(item catalogdb.Item) core.AccountRef {
 	return core.Donations
 }
 
-// orderAAD binds a ciphertext to one order and one field, so an envelope
-// lifted from another row (or the other column) fails to open.
-func orderAAD(orderID uuid.UUID, field string) []byte {
-	return []byte("triplebit-order:v1\x00" + orderID.String() + "|" + field)
-}
-
 // TierChoice is one enrolment option, priced.
 type TierChoice struct {
 	Slug          string
@@ -359,4 +387,23 @@ func (s *Service) Offer(ctx context.Context) (EnrollmentOffer, error) {
 		}
 	}
 	return offer, nil
+}
+
+// resumeAfterRace turns a lost one-pending-order race into the winner's
+// Checkout page. It insists on the named constraint: any other conflict is a
+// different bug and must not be swallowed.
+func (s *Service) resumeAfterRace(ctx context.Context, person Person, program string, cause error) (string, bool, error) {
+	if db.ConstraintOf(cause) != "orders_one_pending_membership_program_per_user_idx" {
+		return "", false, nil
+	}
+	url, ok, err := s.resumePending(ctx, person, program)
+	if err != nil {
+		return "", false, err
+	}
+	if !ok {
+		// The winner vanished between the conflict and this read, so there is
+		// nothing to resume and the original error is the honest answer.
+		return "", false, nil
+	}
+	return url, true, nil
 }

@@ -51,7 +51,7 @@ type Service struct {
 	catalog   *catalogdb.Repo
 	pool      *db.Pool
 	pay       *stripepay.Client
-	keys      *cryptox.Keyring
+	pii       *cryptox.PII
 	env       core.StripeEnvironment
 	baseURL   string
 	now       func() time.Time
@@ -99,6 +99,11 @@ func New(opts Options) (*Service, error) {
 	case opts.BaseURL == "":
 		return nil, errors.New("checkout: a base URL is required")
 	}
+	pii, err := cryptox.NewPII(opts.Keys)
+	if err != nil {
+		return nil, err
+	}
+
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -122,7 +127,7 @@ func New(opts Options) (*Service, error) {
 		catalog:   opts.Catalog,
 		pool:      opts.Pool,
 		pay:       opts.Pay,
-		keys:      opts.Keys,
+		pii:       pii,
 		env:       opts.Environment,
 		baseURL:   strings.TrimRight(opts.BaseURL, "/"),
 		now:       now,
