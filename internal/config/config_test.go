@@ -205,6 +205,28 @@ func TestTheTwoKeyRingsMustNotShareMaterial(t *testing.T) {
 	}
 }
 
+// A base URL carrying a path would make the same-origin check — which
+// compares the Origin header, scheme://host only — reject every form
+// submission. That must be a startup error, not a mystery 403.
+func TestBaseURLMustBeAnOriginOnly(t *testing.T) {
+	for _, raw := range []string{
+		"https://members.example.org/portal",
+		"https://members.example.org/?x=1",
+		"https://user:pass@members.example.org",
+	} {
+		if _, err := loadServe(t, map[string]string{"PORTAL_BASE_URL": raw}); err == nil {
+			t.Errorf("PORTAL_BASE_URL %q was accepted; it is not a bare origin", raw)
+		}
+	}
+
+	// A trailing slash is not a path; operators will type it.
+	if _, err := loadServe(t, map[string]string{
+		"PORTAL_BASE_URL": "https://members.example.org/",
+	}); err != nil {
+		t.Errorf("a trailing slash was rejected: %v", err)
+	}
+}
+
 func TestProductionRequiresHTTPS(t *testing.T) {
 	for name, overrides := range map[string]map[string]string{
 		"base URL":     {"PORTAL_BASE_URL": "http://members.example.org"},

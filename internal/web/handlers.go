@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"triplebit.org/portal/internal/auth"
-	"triplebit.org/portal/internal/httpx"
 	"triplebit.org/portal/internal/web/viewdata"
 	"triplebit.org/portal/web/view"
 )
@@ -19,22 +18,10 @@ func (s *Server) registerRoutes() {
 	s.get("/{$}", s.home)
 	s.get("/static/portal.css", s.stylesheet)
 	s.get("/healthz", s.healthz)
-	s.get("/login", s.limited(s.login))
-	s.get("/auth/callback", s.limited(s.callback))
+	s.getLimited("/login", s.login)
+	s.getLimited("/auth/callback", s.callback)
 	s.getAuthed("/account", s.account)
 	s.post("/logout", s.logout)
-}
-
-// limited applies the per-client rate limit to a sign-in endpoint.
-func (s *Server) limited(h handler) handler {
-	return func(c *reqctx) error {
-		allowed, retryAfter := s.authLimiter.Allow(httpx.ClientIP(c.r, s.trustProxy))
-		if !allowed {
-			httpx.WriteRateLimitExceeded(c.w, retryAfter)
-			return nil
-		}
-		return h(c)
-	}
 }
 
 // notices maps a query flag to the sentence the home page shows. Only these
@@ -162,9 +149,13 @@ func (s *Server) stylesheet(c *reqctx) error {
 	return err
 }
 
-// healthz answers process liveness for the container orchestrator. It touches
-// nothing: a database check belongs to readiness, and the migration Verify at
-// startup already covers schema state.
+// healthz answers process liveness for the container orchestrator. The handler
+// itself touches nothing: a database check belongs to readiness, and the
+// migration Verify at startup already covers schema state. Like every route it
+// passes through the registrar, so a probe that carried a session cookie would
+// load the session first — but orchestrator probes carry no cookies, and
+// keeping the route inside the registrar is worth more than optimising a
+// request nothing sends.
 func (s *Server) healthz(c *reqctx) error {
 	c.w.Header().Set("Cache-Control", "no-store")
 	_, err := c.w.Write([]byte("ok\n"))

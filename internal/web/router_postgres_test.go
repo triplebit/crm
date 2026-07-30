@@ -230,3 +230,27 @@ func TestAccountRequiresASession(t *testing.T) {
 		t.Error("/account does not show the member's name — the M3 gate is exactly this")
 	}
 }
+
+// The sign-in endpoints refuse over-budget clients before doing any work —
+// including the session load, so fabricated cookies cannot buy database
+// lookups past the limit.
+func TestSignInEndpointsAreRateLimited(t *testing.T) {
+	s, token := newTestServer(t)
+	tight, err := httpx.NewRateLimiter(httpx.RateLimitOptions{
+		Requests: 1, Window: time.Minute, MaxKeys: 10,
+	})
+	if err != nil {
+		t.Fatalf("NewRateLimiter: %v", err)
+	}
+	s.authLimiter = tight
+
+	// Anonymous callback with no login cookie: handled without touching OIDC.
+	if w := s.do(t, http.MethodGet, "/auth/callback", "", ""); w.Code != http.StatusSeeOther {
+		t.Fatalf("first callback: status %d, want 303", w.Code)
+	}
+	// Second request exceeds the budget — and carries a session cookie, which
+	// must not be loaded: the refusal happens before the database is asked.
+	if w := s.do(t, http.MethodGet, "/auth/callback", token, ""); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second callback: status %d, want 429", w.Code)
+	}
+}

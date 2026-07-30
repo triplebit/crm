@@ -50,12 +50,22 @@ type route struct {
 	// will be the single, greppable exception; until one exists there is no
 	// exception at all.
 	ValidatesCSRF bool
+
+	// RateLimited applies the per-client auth limiter before anything else —
+	// including the session load, so a flood of requests bearing fabricated
+	// session cookies is refused before it reaches the database.
+	RateLimited bool
 }
 
 // get registers a public page. A session is loaded when present — pages adapt
 // to who is looking at them — but is not required.
 func (s *Server) get(pattern string, h handler) {
 	s.register(route{Method: http.MethodGet, Pattern: pattern}, h)
+}
+
+// getLimited registers a public page behind the per-client auth rate limit.
+func (s *Server) getLimited(pattern string, h handler) {
+	s.register(route{Method: http.MethodGet, Pattern: pattern, RateLimited: true}, h)
 }
 
 // getAuthed registers a page that only a signed-in member can see.
@@ -76,6 +86,14 @@ func (s *Server) register(rt route, h handler) {
 	s.routes = append(s.routes, rt)
 	s.mux.HandleFunc(rt.Method+" "+rt.Pattern, func(w http.ResponseWriter, r *http.Request) {
 		c := &reqctx{w: w, r: r, s: s}
+
+		if rt.RateLimited {
+			allowed, retryAfter := s.authLimiter.Allow(httpx.ClientIP(r, s.trustProxy))
+			if !allowed {
+				httpx.WriteRateLimitExceeded(w, retryAfter)
+				return
+			}
+		}
 
 		if raw, ok := s.jar.Read(r, s.sessionCookie); ok {
 			p, err := s.sessions.Load(r.Context(), raw)

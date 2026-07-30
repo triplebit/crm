@@ -77,6 +77,19 @@ type Keyring struct {
 	Previous map[string][]byte
 }
 
+// Material flattens the ring into id → key bytes, active included, which is
+// the shape cryptox.NewKeyring consumes.
+func (k Keyring) Material() map[string][]byte {
+	keys := make(map[string][]byte, len(k.Previous)+1)
+	for id, key := range k.Previous {
+		keys[id] = key
+	}
+	if len(k.Active) > 0 {
+		keys[k.ActiveID] = k.Active
+	}
+	return keys
+}
+
 // OIDC is the Pocket ID client configuration.
 type OIDC struct {
 	Issuer       string
@@ -229,6 +242,16 @@ func (l *loader) baseURL(env core.Environment) *url.URL {
 		return nil
 	}
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	// The portal cannot be mounted under a subpath: every route is absolute
+	// and cookies are Path=/. Worse, the same-origin check compares the
+	// browser's Origin header — scheme://host only — against this URL, so a
+	// path here would silently 403 every form submission. Refuse it at
+	// startup instead of failing at the first sign-out.
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		l.problems = append(l.problems,
+			fmt.Sprintf("PORTAL_BASE_URL %q must be an origin only — scheme and host, no path, query or credentials", raw))
+		return nil
+	}
 	return parsed
 }
 
@@ -292,8 +315,8 @@ func (l *loader) checkUniversal(cfg *Config) {
 	// rotation quietly move the PII key into the session ring's previous list
 	// (or vice versa), after which recovering one ring decrypts the other's
 	// data — precisely what having two rings is meant to prevent.
-	for piiID, piiKey := range allKeys(cfg.PII) {
-		for sessionID, sessionKey := range allKeys(cfg.Session) {
+	for piiID, piiKey := range cfg.PII.Material() {
+		for sessionID, sessionKey := range cfg.Session.Material() {
 			if string(piiKey) == string(sessionKey) {
 				l.problems = append(l.problems, fmt.Sprintf(
 					"PORTAL_ENCRYPTION key %q and PORTAL_SESSION key %q are the same key material; the rings must be independent",
@@ -377,18 +400,6 @@ func decodeKey(raw string) ([]byte, error) {
 		return nil, errors.New("must not be all zero bytes")
 	}
 	return key, nil
-}
-
-// allKeys flattens a ring into id → key material, active included.
-func allKeys(ring Keyring) map[string][]byte {
-	keys := make(map[string][]byte, len(ring.Previous)+1)
-	for id, key := range ring.Previous {
-		keys[id] = key
-	}
-	if len(ring.Active) > 0 {
-		keys[ring.ActiveID] = ring.Active
-	}
-	return keys
 }
 
 func isAllZero(key []byte) bool {

@@ -56,7 +56,7 @@ func runServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("schema is not current: %w", err)
 	}
 
-	sessionKeys, err := cryptox.NewKeyring(cfg.Session.ActiveID, keyMaterial(cfg.Session))
+	sessionKeys, err := cryptox.NewKeyring(cfg.Session.ActiveID, cfg.Session.Material())
 	if err != nil {
 		return fmt.Errorf("session keyring: %w", err)
 	}
@@ -131,17 +131,6 @@ func runServe(ctx context.Context, args []string) error {
 		}
 		return nil
 	}
-}
-
-// keyMaterial flattens a configured keyring — active plus decrypt-only
-// predecessors — into the map cryptox consumes.
-func keyMaterial(ring config.Keyring) map[string][]byte {
-	keys := make(map[string][]byte, len(ring.Previous)+1)
-	for id, key := range ring.Previous {
-		keys[id] = key
-	}
-	keys[ring.ActiveID] = ring.Active
-	return keys
 }
 
 // runHealthcheck probes a running server from inside its own container, where
