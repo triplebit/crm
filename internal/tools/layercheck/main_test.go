@@ -162,14 +162,25 @@ func TestStripeIsReachableOnlyThroughTheWrapper(t *testing.T) {
 	}
 }
 
-// A scan that cannot see the binary package is a partial scan, and a partial
-// scan that passes is the tool failing open.
+// A scan that cannot see the binary package, or that sees implausibly few
+// packages, is a partial scan — and a partial scan that passes is the tool
+// failing open.
 func TestPartialScanIsRefused(t *testing.T) {
-	pkgs := []pkg{newPkg("internal/core", "internal/leaf")}
-	assertOneProblemContaining(t, assertComplete(pkgs), "module root")
+	small := []pkg{newPkg("internal/core", "internal/leaf")}
+	problems := assertComplete(small)
+	assertProblemContaining(t, problems, "module root")
+	assertProblemContaining(t, problems, "at least")
 
-	withAnchor := append(pkgs, newPkg("cmd/portal"))
-	if problems := assertComplete(withAnchor); len(problems) != 0 {
+	// The anchor alone is not enough: a subtree scan that happens to contain
+	// cmd/portal still fails the package floor.
+	tiny := append(small, newPkg("cmd/portal"))
+	assertProblemContaining(t, assertComplete(tiny), "at least")
+
+	full := []pkg{newPkg("cmd/portal")}
+	for i := 0; i < minPackages; i++ {
+		full = append(full, newPkg(string(rune('a'+i))+"pkg"))
+	}
+	if problems := assertComplete(full); len(problems) != 0 {
 		t.Errorf("a complete scan was refused: %q", problems)
 	}
 }

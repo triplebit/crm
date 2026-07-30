@@ -185,7 +185,9 @@ func (s *Server) fail(c *reqctx, err error) {
 	if requestID != "" {
 		message += " (request " + requestID + ")"
 	}
-	http.Error(c.w, message, http.StatusInternalServerError)
+	// A safe error may carry its own status: a permanent, member-actionable
+	// refusal (409, 422, ...) is not a server fault and must not count as one.
+	http.Error(c.w, message, safeerr.StatusOf(err, http.StatusInternalServerError))
 }
 
 // layout builds the frame every page shares. The CSRF token is derived here,

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -250,14 +251,14 @@ func (s *Sessions) SignIn(ctx context.Context, id Identity) (accounts.User, toke
 		// address, a second IdP account, a case-only variant — trips that
 		// index, and without this branch it would render as an opaque 500 on
 		// every sign-in attempt, forever. The member gets a sentence a human
-		// can act on instead.
+		// can act on, with a conflict status so it never pages anyone.
 		//
-		// ponytail: whether identity is "one person per subject" (drop the
-		// email index) or "one person per email" (link accounts by verified
-		// email) is an open product decision; until it is made, this surfaces
-		// the collision instead of resolving it.
+		// Whether identity is "one person per subject" (drop the email index)
+		// or "one person per email" (link accounts by verified email) is an
+		// open product decision recorded in the roadmap; until it is made,
+		// this surfaces the collision instead of resolving it.
 		if db.ConstraintOf(err) == "users_email_normalized_idx" {
-			return accounts.User{}, tokens.Token{}, safeerr.New(
+			return accounts.User{}, tokens.Token{}, safeerr.WithStatus(http.StatusConflict,
 				"This email address already belongs to a different account. Please contact support.")
 		}
 		return accounts.User{}, tokens.Token{}, err

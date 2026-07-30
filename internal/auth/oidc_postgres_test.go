@@ -320,4 +320,9 @@ func TestSignInWithAnotherAccountsEmailFailsSafely(t *testing.T) {
 	if !safeerr.IsSafe(err) {
 		t.Errorf("the collision error %v is not safe to render; the member would see a blank 500 forever", err)
 	}
+	// A member-actionable refusal, not a server fault: it must not render as
+	// a 500, which would pollute error-rate alerting with support cases.
+	if got := safeerr.StatusOf(err, http.StatusInternalServerError); got != http.StatusConflict {
+		t.Errorf("collision status = %d, want %d", got, http.StatusConflict)
+	}
 }

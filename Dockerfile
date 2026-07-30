@@ -8,7 +8,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /portal ./cmd/portal
+# .git is dockerignored (it would bust the cache every commit), so the VCS
+# stamp go build normally embeds is absent here. The revision arrives as a
+# build arg instead; compose and the make target pass it. An image that
+# cannot say which commit it is fails exactly when that matters.
+ARG PORTAL_REVISION=unknown
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X main.injectedRevision=${PORTAL_REVISION}" \
+    -o /portal ./cmd/portal
 
 # Runtime stage. Distroless static: no shell, no package manager, no root.
 # The healthcheck is the portal binary probing itself, because there is no

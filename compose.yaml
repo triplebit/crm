@@ -54,7 +54,10 @@ services:
           - pocket-id.localhost
 
   migrate:
-    build: .
+    build:
+      context: .
+      args:
+        PORTAL_REVISION: ${PORTAL_REVISION:-unknown}
     image: triplebit-portal
     command: ["migrate"]
     environment:
@@ -64,7 +67,10 @@ services:
         condition: service_healthy
 
   portal:
-    build: .
+    build:
+      context: .
+      args:
+        PORTAL_REVISION: ${PORTAL_REVISION:-unknown}
     image: triplebit-portal
     command: ["serve"]
     ports:

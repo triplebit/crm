@@ -51,9 +51,11 @@ good and are carried forward. What was wrong was the seams.
 
 ### M0 — repo skeleton ✅
 
-CI with no `continue-on-error`; `make check` runs exactly what CI runs;
-`layercheck` makes the package layering a build failure; `internal/core` with
-`AccountRef` and `Environment` as opaque types whose zero value panics.
+CI with no `continue-on-error`; every CI gate is a `make` target, and
+`make check` is the offline subset (CI additionally runs `test-db`, `vuln` and
+`compose-check`); `layercheck` makes the package layering a build failure;
+`internal/core` with `AccountRef` and `Environment` as opaque types whose zero
+value panics.
 
 ### M1 — schema, migrations, transactions ✅
 

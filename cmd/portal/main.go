@@ -61,17 +61,29 @@ func main() {
 	}
 }
 
+// injectedRevision is set with -ldflags "-X main.injectedRevision=<sha>" by
+// the Docker build, where no .git directory exists (it is dockerignored to
+// keep the build cache stable) and debug.ReadBuildInfo therefore has no VCS
+// stamp. Without this, the deployed image — the one place identity matters
+// during an incident — is the one build that reports "unknown".
+var injectedRevision string
+
 func runVersion(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("expected no arguments, got %d", len(args))
 	}
 
 	revision, modified := "unknown", ""
+	if injectedRevision != "" {
+		revision = injectedRevision
+	}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range info.Settings {
 			switch s.Key {
 			case "vcs.revision":
-				revision = s.Value
+				if injectedRevision == "" {
+					revision = s.Value
+				}
 			case "vcs.modified":
 				if s.Value == "true" {
 					modified = " (modified)"

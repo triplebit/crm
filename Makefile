@@ -12,7 +12,8 @@ TEST_DB_URL  ?= postgres://portal:portal@127.0.0.1:$(TEST_DB_PORT)/portal_test?s
 # drift apart. (The reverse does not hold: db-up, clean and friends are local
 # conveniences.)
 .PHONY: all check build test test-db vet fmt fmt-check generate generate-check \
-        layercheck lint-cookie mod-verify vuln compose-check db-up db-down clean
+        layercheck lint-cookie mod-verify vuln compose-check docker-build \
+        db-up db-down clean
 
 all: check
 
@@ -106,6 +107,11 @@ compose-check:
 	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
 	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
 	docker compose config -q
+
+# Builds the container image with the revision stamped in, since the build
+# context deliberately excludes .git.
+docker-build:
+	PORTAL_REVISION=$$(git rev-parse HEAD) docker compose build
 
 clean:
 	rm -rf bin

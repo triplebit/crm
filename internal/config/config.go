@@ -127,9 +127,12 @@ func Load() (*Config, error) {
 	cfg.SessionAbsoluteTTL = l.duration("PORTAL_SESSION_ABSOLUTE_TTL", defaultAbsoluteTTL)
 
 	cfg.OIDC = OIDC{
-		Issuer:       strings.TrimSpace(os.Getenv("PORTAL_OIDC_ISSUER")),
-		ClientID:     strings.TrimSpace(os.Getenv("PORTAL_OIDC_CLIENT_ID")),
-		ClientSecret: os.Getenv("PORTAL_OIDC_CLIENT_SECRET"),
+		Issuer:   strings.TrimSpace(os.Getenv("PORTAL_OIDC_ISSUER")),
+		ClientID: strings.TrimSpace(os.Getenv("PORTAL_OIDC_CLIENT_ID")),
+		// Trimmed like every sibling: a copy-pasted secret with a trailing
+		// newline fails the OIDC exchange closed, which is safe but reads as
+		// "Pocket ID is broken" to the operator who pasted it.
+		ClientSecret: strings.TrimSpace(os.Getenv("PORTAL_OIDC_CLIENT_SECRET")),
 		RedirectURL:  strings.TrimSpace(os.Getenv("PORTAL_OIDC_REDIRECT_URL")),
 	}
 

@@ -23,7 +23,10 @@ type Safe interface {
 	SafeMessage() string
 }
 
-type safeError struct{ message string }
+type safeError struct {
+	message string
+	status  int
+}
 
 func (e safeError) Error() string       { return e.message }
 func (e safeError) SafeMessage() string { return e.message }
@@ -31,6 +34,25 @@ func (e safeError) SafeMessage() string { return e.message }
 // New returns an error whose message may be shown to the user.
 func New(message string) error {
 	return safeError{message: message}
+}
+
+// WithStatus returns a safe error that also names the HTTP status the
+// presentation layer should use. A safe refusal rendered as a 500 pollutes
+// error-rate alerting and pages someone for what is actually a support case;
+// carrying the status here keeps the service the author of the distinction
+// without importing anything from the web layer.
+func WithStatus(status int, message string) error {
+	return safeError{message: message, status: status}
+}
+
+// StatusOf returns the status carried by err, or fallback when it carries
+// none. Only meaningful at the presentation boundary.
+func StatusOf(err error, fallback int) int {
+	var carrier safeError
+	if errors.As(err, &carrier) && carrier.status != 0 {
+		return carrier.status
+	}
+	return fallback
 }
 
 // Message returns the user-facing message carried by err, or fallback when err

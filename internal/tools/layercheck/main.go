@@ -161,19 +161,31 @@ func main() {
 // check returns one message per violation, or nil when the graph is clean. It is
 // separated from main so the rules themselves are unit-testable: an enforcement
 // tool that has never been observed to fail is not known to work.
+// minPackages is a floor well below the real count (20 at the time of
+// writing) but far above what any subdirectory scan produces. Update it the
+// day the module legitimately shrinks below it, which would be news.
+const minPackages = 15
+
 // assertComplete refuses a scan that cannot see the whole module. Run from a
 // subdirectory, `go list ./...` returns a fraction of the packages and every
 // rule passes vacuously — "0 packages, layering clean" is a failure mode, not
-// a success.
+// a success. Both checks matter: the anchor catches scans rooted elsewhere,
+// the floor catches a scan rooted at a subtree that happens to contain it.
 func assertComplete(pkgs []pkg) []string {
+	var problems []string
+	if len(pkgs) < minPackages {
+		problems = append(problems, fmt.Sprintf(
+			"only %d packages in the scan, expected at least %d. Run layercheck from the module root: a partial scan passes every rule vacuously.",
+			len(pkgs), minPackages))
+	}
 	for _, p := range pkgs {
 		if trimModule(p.ImportPath) == anchorPkg {
-			return nil
+			return problems
 		}
 	}
-	return []string{fmt.Sprintf(
+	return append(problems, fmt.Sprintf(
 		"%s is not in the scan. Run layercheck from the module root: a partial scan passes every rule vacuously.",
-		anchorPkg)}
+		anchorPkg))
 }
 
 func check(pkgs []pkg, layers map[string]int) []string {
