@@ -36,11 +36,19 @@ type EnrollmentRequest struct {
 	TierSlug      string
 	IncludeDevice bool
 
-	// IMEI is required even for BYOD — the SIM needs a device to live in.
+	// IMEI identifies the member's own device, and is required only when
+	// they are bringing one: a device bought here has its IMEI recorded by
+	// staff at fulfillment, from the unit actually shipped, which is the
+	// only party who can know it. Asking the member for it would be asking
+	// them to invent it.
 	IMEI string
-	// ShippingAddress is where the SIM (and device, if any) goes.
-	ShippingAddress string
 }
+
+// The shipping address is deliberately absent from this struct. Stripe
+// collects it on the hosted page — it validates and autocompletes, and the
+// address then arrives on the settled session, so the portal never stores a
+// shipping address for an order nobody paid for. It is projected onto the
+// order by M6's webhook, alongside every other settled fact.
 
 // StartEnrollment turns a choice into a Stripe Checkout URL, crash-safe at
 // every step:
@@ -77,15 +85,24 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		lines = append(lines, pendingLine{item: device, version: deviceVersion, quantity: 1})
 	}
 
-	imei := strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")
-	if !imeiPattern.MatchString(imei) {
+	orderID := uuid.New()
+	imeiSealed := ""
+	if !req.IncludeDevice {
+		imei := strings.ReplaceAll(strings.TrimSpace(req.IMEI), " ", "")
+		if !imeiPattern.MatchString(imei) {
+			return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
+				"Enter your device's IMEI: 14 to 16 digits, usually under Settings → About.")
+		}
+		imeiSealed, err = s.keys.Encrypt([]byte(imei), orderAAD(orderID, "imei"))
+		if err != nil {
+			return "", fmt.Errorf("checkout: seal imei: %w", err)
+		}
+	} else if strings.TrimSpace(req.IMEI) != "" {
+		// A device order carrying an IMEI means the form and the service
+		// disagree about who supplies it. Refuse rather than store a number
+		// staff will contradict at fulfillment.
 		return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
-			"Enter the device IMEI: 14 to 16 digits, usually under Settings → About.")
-	}
-	address := strings.TrimSpace(req.ShippingAddress)
-	if address == "" || len(address) > 1000 {
-		return "", safeerr.WithStatus(http.StatusUnprocessableEntity,
-			"Enter the shipping address for your SIM card.")
+			"Leave the IMEI blank when we are sending you a device: we record it when it ships.")
 	}
 
 	customerID, err := s.EnsureCustomer(ctx, core.Memberships, person)
@@ -93,26 +110,17 @@ func (s *Service) StartEnrollment(ctx context.Context, person Person, req Enroll
 		return "", err
 	}
 
-	orderID := uuid.New()
-	imeiSealed, err := s.keys.Encrypt([]byte(imei), orderAAD(orderID, "imei"))
-	if err != nil {
-		return "", fmt.Errorf("checkout: seal imei: %w", err)
-	}
-	addressSealed, err := s.keys.Encrypt([]byte(address), orderAAD(orderID, "shipping"))
-	if err != nil {
-		return "", fmt.Errorf("checkout: seal shipping address: %w", err)
-	}
-
 	order := orders.Order{
-		ID:                        orderID,
-		UserID:                    person.UserID,
-		Program:                   "hotspot",
-		Environment:               s.env,
-		Account:                   core.Memberships,
-		Currency:                  tierVersion.Currency,
-		IMEICiphertext:            imeiSealed,
-		ShippingAddressCiphertext: addressSealed,
-		IdempotencyKey:            "order:" + orderID.String(),
+		ID:             orderID,
+		UserID:         person.UserID,
+		Program:        "hotspot",
+		Environment:    s.env,
+		Account:        core.Memberships,
+		Currency:       tierVersion.Currency,
+		IMEICiphertext: imeiSealed,
+		// shipping_address_ciphertext stays NULL until M6 projects what
+		// Stripe collected on the hosted page.
+		IdempotencyKey: "order:" + orderID.String(),
 	}
 
 	now := s.now().UTC()
@@ -221,6 +229,12 @@ func (s *Service) createAndAttachSessionFor(ctx context.Context, order orders.Or
 			PriceID:  line.StripePriceID,
 			Quantity: int64(line.Quantity),
 		})
+		// The frozen line already records whether it ships, so the hosted
+		// page asks for an address exactly when something physical is being
+		// sold — the catalog decides, not the handler.
+		if line.RequiresShipping {
+			spec.CollectShipping = true
+		}
 	}
 	session, err := s.pay.CreateCheckoutSession(ctx, order.Account, order.IdempotencyKey, spec)
 	if err != nil {

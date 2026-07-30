@@ -106,6 +106,9 @@ compose-check:
 	PORTAL_SESSION_KEY=check PORTAL_SESSION_KEY_ID=check \
 	PORTAL_ENCRYPTION_KEY=check PORTAL_ENCRYPTION_KEY_ID=check \
 	PORTAL_OIDC_CLIENT_ID=check PORTAL_OIDC_CLIENT_SECRET=check \
+	PORTAL_STRIPE_SECRET_KEY=check \
+	PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT=check \
+	PORTAL_STRIPE_DONATIONS_ACCOUNT=check \
 	docker compose config -q
 
 # Builds the container image with the revision stamped in, since the build

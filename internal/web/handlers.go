@@ -215,10 +215,9 @@ func (s *Server) enrollForm(c *reqctx) error {
 
 func (s *Server) enrollSubmit(c *reqctx) error {
 	req := checkout.EnrollmentRequest{
-		TierSlug:        c.r.PostForm.Get("tier"),
-		IncludeDevice:   c.r.PostForm.Get("device") == "yes",
-		IMEI:            c.r.PostForm.Get("imei"),
-		ShippingAddress: c.r.PostForm.Get("shipping_address"),
+		TierSlug:      c.r.PostForm.Get("tier"),
+		IncludeDevice: c.r.PostForm.Get("device") == "yes",
+		IMEI:          c.r.PostForm.Get("imei"),
 	}
 	url, err := s.checkout.StartEnrollment(c.r.Context(), checkout.Person{
 		UserID: c.principal.User.ID,
@@ -239,7 +238,6 @@ func (s *Server) enrollSubmit(c *reqctx) error {
 		data.TierSlug = req.TierSlug
 		data.IncludeDevice = req.IncludeDevice
 		data.IMEI = req.IMEI
-		data.ShippingAddress = req.ShippingAddress
 		c.w.WriteHeader(safeerr.StatusOf(err, http.StatusUnprocessableEntity))
 		return view.Enroll(data).Render(c.r.Context(), c.w)
 	}

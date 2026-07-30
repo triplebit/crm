@@ -104,11 +104,12 @@ func cleanupOrders(t *testing.T, pool *db.Pool, userID uuid.UUID) {
 	})
 }
 
+// enrollment is the BYOD shape: the member's own device, so an IMEI. A
+// device order leaves it blank — staff record it from the unit shipped.
 func enrollment(slug string) checkout.EnrollmentRequest {
 	return checkout.EnrollmentRequest{
-		TierSlug:        slug,
-		IMEI:            "356938035643809",
-		ShippingAddress: "1 Test Street, Testville, TS 00001",
+		TierSlug: slug,
+		IMEI:     "356938035643809",
 	}
 }
 
@@ -123,6 +124,7 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 
 	req := enrollment(tier.Slug)
 	req.IncludeDevice = true
+	req.IMEI = "" // we are shipping the device; staff record its IMEI
 	url, err := svc.StartEnrollment(ctx, person, req)
 	if err != nil {
 		t.Fatalf("StartEnrollment: %v", err)
@@ -133,19 +135,26 @@ func TestStartEnrollmentReachesCheckout(t *testing.T) {
 
 	// The order: pending, session attached, both lines frozen with the
 	// version identifiers they were sold under, encrypted PII present.
-	var state, sessionID, imei string
+	var state, sessionID, imei, shipping string
 	var orderID uuid.UUID
 	if err := pool.Conn().QueryRow(ctx, `
-		SELECT id, state, COALESCE(stripe_checkout_session_id, ''), COALESCE(imei_ciphertext, '')
+		SELECT id, state, COALESCE(stripe_checkout_session_id, ''),
+		       COALESCE(imei_ciphertext, ''), COALESCE(shipping_address_ciphertext, '')
 		FROM orders WHERE user_id = $1
-	`, person.UserID).Scan(&orderID, &state, &sessionID, &imei); err != nil {
+	`, person.UserID).Scan(&orderID, &state, &sessionID, &imei, &shipping); err != nil {
 		t.Fatalf("read order: %v", err)
 	}
 	if state != "checkout_pending" || sessionID == "" {
 		t.Errorf("order state=%s session=%q; want checkout_pending with a session", state, sessionID)
 	}
-	if !strings.HasPrefix(imei, "v1.") {
-		t.Errorf("imei_ciphertext %q is not an envelope", imei)
+	// This order buys a device, so no member-supplied IMEI; and the shipping
+	// address belongs to Stripe's page until M6 projects it. Both empty is
+	// the correct pre-settlement state.
+	if imei != "" {
+		t.Errorf("a device order stored an IMEI (%q); staff record it at fulfillment", imei)
+	}
+	if shipping != "" {
+		t.Errorf("a shipping address was stored before settlement: %q", shipping)
 	}
 
 	var lines, reservations int
@@ -192,6 +201,7 @@ func TestStartEnrollmentRefusesWhenOutOfStock(t *testing.T) {
 
 	req := enrollment(tier.Slug)
 	req.IncludeDevice = true
+	req.IMEI = ""
 	_, err := svc.StartEnrollment(ctx, person, req)
 	if err == nil {
 		t.Fatal("an out-of-stock device was sold")
@@ -273,10 +283,13 @@ func TestStartEnrollmentValidation(t *testing.T) {
 		t.Errorf("bad IMEI: %v", err)
 	}
 
-	noAddress := enrollment(tier.Slug)
-	noAddress.ShippingAddress = "   "
-	if _, err := svc.StartEnrollment(ctx, person, noAddress); err == nil || !safeerr.IsSafe(err) {
-		t.Errorf("missing address: %v", err)
+	// A device order must not carry a member-supplied IMEI: staff record the
+	// IMEI of the unit actually shipped, and two sources for one fact is the
+	// mistake this codebase exists to avoid.
+	deviceWithIMEI := enrollment(tier.Slug)
+	deviceWithIMEI.IncludeDevice = true
+	if _, err := svc.StartEnrollment(ctx, person, deviceWithIMEI); err == nil || !safeerr.IsSafe(err) {
+		t.Errorf("device order with an IMEI: %v", err)
 	}
 
 	if _, err := svc.StartEnrollment(ctx, person, enrollment("no-such-tier")); err == nil ||

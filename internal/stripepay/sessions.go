@@ -41,7 +41,18 @@ type SessionSpec struct {
 	// ExpiresAt bounds how long the hosted page can complete. Stripe
 	// requires 30 minutes to 24 hours.
 	ExpiresAt time.Time
+
+	// CollectShipping asks Stripe to collect a shipping address on the
+	// hosted page. Stripe validates and autocompletes it, and the address
+	// arrives back on the settled session — so the portal never stores one
+	// for an order that was never paid.
+	CollectShipping bool
 }
+
+// shippingCountries is where the portal ships. Hotspot service is US mobile
+// service, so this is the US; widening it is one line and a policy decision,
+// not a code change.
+var shippingCountries = []string{"US"}
 
 // Session is the subset of a Checkout Session the portal reads at creation.
 type Session struct {
@@ -87,6 +98,11 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, account core.Account
 	}
 	if !spec.ExpiresAt.IsZero() {
 		params.ExpiresAt = stripe.Int64(spec.ExpiresAt.Unix())
+	}
+	if spec.CollectShipping {
+		params.ShippingAddressCollection = &stripe.CheckoutSessionCreateShippingAddressCollectionParams{
+			AllowedCountries: stripe.StringSlice(shippingCountries),
+		}
 	}
 	for _, line := range spec.Lines {
 		if line.PriceID == "" || line.Quantity <= 0 {

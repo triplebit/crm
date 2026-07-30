@@ -138,12 +138,12 @@ func Enroll(d viewdata.Enroll) templ.Component {
 					return templ_7745c5c3_Err
 				}
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "</fieldset>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "</fieldset><fieldset><legend>Your device</legend> ")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			if d.DeviceAvailable {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "<fieldset><legend>Device</legend> <label class=\"option\"><input type=\"checkbox\" name=\"device\" value=\"yes\"")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "<label class=\"option\"><input type=\"checkbox\" name=\"device\" value=\"yes\"")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -153,7 +153,7 @@ func Enroll(d viewdata.Enroll) templ.Component {
 						return templ_7745c5c3_Err
 					}
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, "> <span>Add a hotspot device (instead of bringing your own)</span> <strong>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, "> <span>Send me a hotspot device</span> <strong>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -166,38 +166,25 @@ func Enroll(d viewdata.Enroll) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 16, "</strong></label></fieldset>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 16, "</strong></label> ")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 17, "<fieldset><legend>Your device</legend> <label>IMEI (14–16 digits, required for BYOD too) <input type=\"text\" name=\"imei\" inputmode=\"numeric\" required value=\"")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 17, "<label>IMEI of your own device <input type=\"text\" name=\"imei\" inputmode=\"numeric\" pattern=\"[0-9 ]{14,20}\" value=\"")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			var templ_7745c5c3_Var9 string
 			templ_7745c5c3_Var9, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.IMEI)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `web/view/enroll.templ`, Line: 39, Col: 80}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `web/view/enroll.templ`, Line: 37, Col: 45}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var9)
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, "\"></label></fieldset><fieldset><legend>Shipping</legend> <label>Where should we send your SIM card? <textarea name=\"shipping_address\" rows=\"4\" required>")
-			if templ_7745c5c3_Err != nil {
-				return templ_7745c5c3_Err
-			}
-			var templ_7745c5c3_Var10 string
-			templ_7745c5c3_Var10, templ_7745c5c3_Err = templ.JoinStringErrs(d.ShippingAddress)
-			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `web/view/enroll.templ`, Line: 46, Col: 77}
-			}
-			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var10))
-			if templ_7745c5c3_Err != nil {
-				return templ_7745c5c3_Err
-			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "</textarea></label></fieldset><button type=\"submit\">Continue to payment</button></form></section>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, "\"> <small>Leave this blank if you ticked the box above — we record the IMEI of the device we send you. Otherwise enter your own device's IMEI: 14–16 digits, usually under Settings → About.</small></label></fieldset><p class=\"note\">We will ask for your shipping address on the payment page — your SIM card ships there.</p><button type=\"submit\">Continue to payment</button></form></section>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}

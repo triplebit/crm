@@ -64,9 +64,8 @@ type Enroll struct {
 
 	// Error is a member-safe sentence from a rejected submission, and the
 	// re-rendered form keeps what they typed.
-	Error           string
-	TierSlug        string
-	IncludeDevice   bool
-	IMEI            string
-	ShippingAddress string
+	Error         string
+	TierSlug      string
+	IncludeDevice bool
+	IMEI          string
 }

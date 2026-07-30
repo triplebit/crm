@@ -22,30 +22,30 @@ templ Enroll(d viewdata.Enroll) {
 						</label>
 					}
 				</fieldset>
-				if d.DeviceAvailable {
-					<fieldset>
-						<legend>Device</legend>
-						<label class="option">
-							<input type="checkbox" name="device" value="yes" checked?={ d.IncludeDevice }/>
-							<span>Add a hotspot device (instead of bringing your own)</span>
-							<strong>{ d.DevicePriceLabel }</strong>
-						</label>
-					</fieldset>
-				}
 				<fieldset>
 					<legend>Your device</legend>
+					if d.DeviceAvailable {
+						<label class="option">
+							<input type="checkbox" name="device" value="yes" checked?={ d.IncludeDevice }/>
+							<span>Send me a hotspot device</span>
+							<strong>{ d.DevicePriceLabel }</strong>
+						</label>
+					}
 					<label>
-						IMEI (14–16 digits, required for BYOD too)
-						<input type="text" name="imei" inputmode="numeric" required value={ d.IMEI }/>
+						IMEI of your own device
+						<input type="text" name="imei" inputmode="numeric"
+							pattern="[0-9 ]{14,20}" value={ d.IMEI }/>
+						<small>
+							Leave this blank if you ticked the box above — we record the
+							IMEI of the device we send you. Otherwise enter your own
+							device's IMEI: 14–16 digits, usually under Settings → About.
+						</small>
 					</label>
 				</fieldset>
-				<fieldset>
-					<legend>Shipping</legend>
-					<label>
-						Where should we send your SIM card?
-						<textarea name="shipping_address" rows="4" required>{ d.ShippingAddress }</textarea>
-					</label>
-				</fieldset>
+				<p class="note">
+					We will ask for your shipping address on the payment page — your SIM
+					card ships there.
+				</p>
 				<button type="submit">Continue to payment</button>
 			</form>
 		</section>
