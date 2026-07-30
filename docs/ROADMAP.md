@@ -3,7 +3,7 @@
 Progress tracker for the rebuild. Every milestone ends in a command a human runs
 whose output is the gate — never "wrote package X".
 
-**Status: M6 next.**
+**Status: M6 code complete; its gate needs two Stripe webhook endpoints. M7 next.**
 
 | | Milestone | Gate | Status |
 |---|---|---|---|
@@ -13,7 +13,7 @@ whose output is the gate — never "wrote package X".
 | M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ✅ done |
 | M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ✅ done |
 | M5 | Money out | a real test card reaches Stripe Checkout | ✅ done |
-| M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ next |
+| M6 | Money in, durably | the order settles by itself, replay-safe | 🟨 code complete, gate pending |
 | M7 | Staff can fulfill | the launch sentence, one person, one sitting | ⬜ |
 | M8 | Deploy, rotation, privacy | clean VPS, live Stripe, a real $1 donation | ⬜ |
 | M9 | Tax acknowledgments | a refund produces a correction revision | ⬜ |
@@ -189,6 +189,31 @@ single claim pattern, the `observed_at` semantics for the out-of-order guard
 get pinned to canonical-retrieval time and tested with shuffled delivery, and
 `webhook_events.payload` gets a retention window — it is the one place raw
 PII would otherwise sit in the clear forever.
+
+**Built.** Migration 000004, the verifier, the inbox, the projector, the
+worker, and `POST /stripe/webhook/{account}` — one endpoint per account, so an
+event delivered to the wrong one fails its signature instead of landing in the
+wrong ledger. Settlement authorities stayed at six event types rather than 17;
+the rest are recorded as ignored, because "never delivered" and "delivered and
+irrelevant" must stay distinguishable when someone asks why an order did not
+settle.
+
+The reservation sweep landed as `checkout.Abandoner`, its own type rather than
+a method on the checkout service, because the service requires the PII keyring
+and releasing stock needs no personal data. The worker therefore never holds
+that key, and `make compose-check` fails if its container is ever given one.
+
+Two things the tests found that the design had not: Stripe sends no `Origin`
+header, so the same-origin middleware would have refused every delivery before
+any handler ran; and `ExpiredPending` was not scoped to an environment, so a
+sandbox worker would have abandoned live members' checkouts.
+
+**The gate still needs the owner.** Two webhook endpoints must exist in Stripe
+(one per account, on the API version `stripepay.ExpectedAPIVersion`) with their
+signing secrets in `.env` — see `.env.example`. Locally that means the Stripe
+CLI, since Stripe cannot reach localhost. Until then the portal refuses to
+start, which is the correct refusal: a server that cannot verify a webhook
+takes money and settles nothing.
 
 ### M7 — staff can fulfill
 
