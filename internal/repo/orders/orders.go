@@ -236,10 +236,14 @@ func nullUUID(id uuid.UUID) *uuid.UUID {
 	return &id
 }
 
-// Abandon marks a pending order expired and releases every hold it took, in
-// one statement each so the two can never disagree. It is the member-path
-// half of reservation recovery; the worker sweep (M6) is the other, and both
-// are idempotent: an order already out of checkout_pending affects no rows.
+// Abandon marks a pending order expired and releases every hold it took.
+//
+// CALLERS MUST PASS A TRANSACTION. It makes four writes, and a partial
+// application is worse than none: the first write moves the order out of
+// checkout_pending, so a retry reports false and never repairs the rest,
+// leaving stock reserved for an order nobody can pay. Idempotent as a whole —
+// an order already out of checkout_pending affects no rows — but only atomic
+// if the caller made it so.
 func (r *Repo) Abandon(ctx context.Context, q db.Conn, orderID uuid.UUID, at time.Time, reason string) (bool, error) {
 	tag, err := q.Exec(ctx, `
 		UPDATE orders SET state = 'expired', updated_at = now()
@@ -278,4 +282,104 @@ func (r *Repo) Abandon(ctx context.Context, q db.Conn, orderID uuid.UUID, at tim
 		return false, fmt.Errorf("orders: record abandonment: %w", db.Normalize(err))
 	}
 	return true, nil
+}
+
+// ByCheckoutSession finds the order a Stripe Checkout Session belongs to.
+// Settlement arrives naming a session, so this is the projector's entry point.
+func (r *Repo) ByCheckoutSession(ctx context.Context, q db.Conn, env core.StripeEnvironment, account core.AccountRef, sessionID string) (Order, error) {
+	o := Order{Environment: env, Account: account}
+	err := q.QueryRow(ctx, `
+		SELECT id, user_id, program, state, currency,
+		       COALESCE(imei_ciphertext, ''), created_at, idempotency_key
+		FROM orders
+		WHERE environment = $1 AND account_ref = $2 AND stripe_checkout_session_id = $3
+	`, env.String(), account.String(), sessionID).Scan(
+		&o.ID, &o.UserID, &o.Program, &o.State, &o.Currency,
+		&o.IMEICiphertext, &o.CreatedAt, &o.IdempotencyKey,
+	)
+	if err != nil {
+		return Order{}, fmt.Errorf("orders: order for session %s: %w", sessionID, db.Normalize(err))
+	}
+	o.CheckoutSessionID = sessionID
+	return o, nil
+}
+
+// Settle records that money arrived: the order becomes paid, its Stripe
+// identifiers are stored, and its held reservations become committed stock.
+//
+// Idempotent by state. The WHERE clause admits only checkout_pending, so a
+// replayed event — Stripe retries, and the same settlement can be reached by
+// more than one event type — affects no rows the second time and reports
+// false. That is the whole replay defence: not a dedup table, just a state
+// machine that only moves forward.
+func (r *Repo) Settle(ctx context.Context, q db.Conn, orderID uuid.UUID, paymentIntentID, subscriptionID, invoiceID string, at time.Time) (bool, error) {
+	tag, err := q.Exec(ctx, `
+		UPDATE orders
+		SET state = 'paid',
+		    paid_at = $2,
+		    stripe_payment_intent_id = COALESCE(NULLIF($3, ''), stripe_payment_intent_id),
+		    stripe_subscription_id   = COALESCE(NULLIF($4, ''), stripe_subscription_id),
+		    stripe_invoice_id        = COALESCE(NULLIF($5, ''), stripe_invoice_id),
+		    updated_at = now()
+		WHERE id = $1 AND state = 'checkout_pending'
+	`, orderID, at, paymentIntentID, subscriptionID, invoiceID)
+	if err != nil {
+		return false, fmt.Errorf("orders: settle %s: %w", orderID, db.Normalize(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	// Held stock becomes committed: it has been paid for and is owed to a
+	// member. inventory.reserved stays as it is — the stock is still not
+	// available to anyone else — until fulfillment ships it and decrements
+	// on_hand, which is M7's business.
+	if _, err := q.Exec(ctx, `
+		UPDATE inventory_reservations r
+		SET state = 'committed', updated_at = now()
+		FROM order_lines l
+		WHERE l.id = r.order_line_id AND l.order_id = $1 AND r.state = 'held'
+	`, orderID); err != nil {
+		return false, fmt.Errorf("orders: commit reservations for %s: %w", orderID, db.Normalize(err))
+	}
+	if _, err := q.Exec(ctx, `
+		INSERT INTO order_state_history (id, order_id, from_state, to_state, reason, source)
+		VALUES ($1, $2, 'checkout_pending', 'paid', 'settled by verified webhook', 'stripe')
+	`, uuid.New(), orderID); err != nil {
+		return false, fmt.Errorf("orders: record settlement: %w", db.Normalize(err))
+	}
+	return true, nil
+}
+
+// ExpiredPending lists pending orders past their window, for the worker to
+// abandon one at a time.
+//
+// It returns identifiers rather than doing the work because abandoning needs a
+// transaction per order and a remote call before each one, and a repository is
+// the wrong place to own either. The worker composes; this just answers "which
+// ones?".
+func (r *Repo) ExpiredPending(ctx context.Context, q db.Conn, olderThan time.Time, limit int) ([]uuid.UUID, error) {
+	rows, err := q.Query(ctx, `
+		SELECT id FROM orders
+		WHERE state = 'checkout_pending' AND created_at < $1
+		ORDER BY created_at
+		LIMIT $2
+	`, olderThan, limit)
+	if err != nil {
+		return nil, fmt.Errorf("orders: list expired: %w", db.Normalize(err))
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("orders: scan expired: %w", db.Normalize(err))
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("orders: iterate expired: %w", db.Normalize(err))
+	}
+	return ids, nil
 }

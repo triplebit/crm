@@ -44,7 +44,7 @@ services:
       # deliberate layout from an image upgraded without pg_upgrade. The
       # single higher mount is also what makes a future pg_upgrade --link
       # possible without crossing a mount boundary.
-      - db-data:/var/lib/postgresql
+      - db-data-18:/var/lib/postgresql
 
   pocket-id:
     image: ghcr.io/pocket-id/pocket-id@sha256:4a277d141d6069fd9a7b321a9aca80f4b9812b8fa122ee566d2f15900e3d8448 # v2.12.0
@@ -116,5 +116,15 @@ services:
     restart: on-failure:5
 
 volumes:
-  db-data:
+  # Named for its major version deliberately. Postgres 18 stores data in a
+  # major-version subdirectory and refuses to start against a 17 layout, so
+  # reusing one volume name across the upgrade would have turned a rollback
+  # into a data-loss decision. A 17 volume from an earlier checkout is left
+  # untouched under its old name, and `docker volume ls` still shows it.
+  #
+  # There is no pg_upgrade path here because there is no production data yet
+  # (M8 deploys). For a local database worth keeping: dump from 17 with
+  # `pg_dump` before switching, then restore into 18. For one that is not,
+  # `portal migrate` rebuilds the schema and `catalog-sync` the catalog.
+  db-data-18:
   pocket-id-data:

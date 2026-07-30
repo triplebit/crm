@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	stripe "github.com/stripe/stripe-go/v86"
 	"github.com/stripe/stripe-go/v86/webhook"
 
 	"triplebit.org/portal/internal/core"
@@ -16,6 +18,22 @@ import (
 // is deliberately one error: a caller has nothing to do differently, and
 // telling a forger which half failed helps only them.
 var ErrBadSignature = errors.New("stripepay: webhook signature is not valid")
+
+// ErrAPIVersionMismatch means the event was authentic but its Stripe API
+// version is not the one this build of stripe-go understands.
+//
+// It is a separate error because the two demand opposite responses. A bad
+// signature might be an attack and should be investigated. A version mismatch
+// is a misconfigured endpoint — the webhook was created against a different API
+// version — and every event will fail identically until someone fixes it in the
+// Stripe Dashboard. Reporting the second as the first sends an operator hunting
+// an intruder instead of reading ExpectedAPIVersion.
+var ErrAPIVersionMismatch = errors.New("stripepay: webhook event API version is not the expected one")
+
+// ExpectedAPIVersion is the Stripe API version this build understands, and the
+// version a webhook endpoint must be created with. `portal doctor` reports it
+// so the value never has to be guessed from a library upgrade.
+const ExpectedAPIVersion = stripe.APIVersion
 
 // Event is the subset of a verified Stripe event the portal acts on. The
 // stripe-go type is deliberately not exposed: nothing outside this package
@@ -96,6 +114,13 @@ func (v *WebhookVerifier) Verify(account core.AccountRef, body []byte, signature
 	}
 	raw, err := webhook.ConstructEvent(body, signatureHeader, secret)
 	if err != nil {
+		// stripe-go returns one error type for both, so the message is the only
+		// discriminator available. Getting this wrong costs an operator hours,
+		// so it is worth the string match.
+		if strings.Contains(err.Error(), "API version") {
+			return Event{}, fmt.Errorf("%w (expected %s): %v",
+				ErrAPIVersionMismatch, ExpectedAPIVersion, err)
+		}
 		return Event{}, fmt.Errorf("%w: %v", ErrBadSignature, err)
 	}
 

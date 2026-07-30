@@ -227,8 +227,7 @@ func (s *Service) resumePending(ctx context.Context, person Person, program stri
 	// hold forward, abandon the order: the member gets a fresh one at current
 	// prices, and the stock goes back.
 	if s.now().UTC().After(pending.CreatedAt.Add(resumeWindow)) {
-		if _, err := s.orders.Abandon(ctx, s.pool.Conn(), pending.ID, s.now().UTC(),
-			"checkout not completed within the reservation window"); err != nil {
+		if err := s.abandon(ctx, pending); err != nil {
 			return "", false, err
 		}
 		return "", false, nil
@@ -406,4 +405,29 @@ func (s *Service) resumeAfterRace(ctx context.Context, person Person, program st
 		return "", false, nil
 	}
 	return url, true, nil
+}
+
+// abandon retires a stale pending order: unpayable first, then released.
+//
+// The order matters. Releasing stock while the hosted page is still payable —
+// Stripe's window is 24 hours, longer than resumeWindow — would let a member
+// pay for stock already given to someone else. And because Stripe refuses to
+// expire a session that has completed, an error here means the money arrived,
+// so nothing is released and the projector settles the order instead. The
+// unsafe interleaving is unreachable rather than guarded against.
+func (s *Service) abandon(ctx context.Context, order orders.Order) error {
+	if order.CheckoutSessionID != "" {
+		if err := s.pay.ExpireCheckoutSession(ctx, order.Account,
+			"expire:"+order.CheckoutSessionID, order.CheckoutSessionID); err != nil {
+			return err
+		}
+	}
+	// One transaction: the four writes Abandon makes must all land or none,
+	// or a retry finds the order already out of checkout_pending and never
+	// repairs the rest.
+	return s.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
+		_, err := s.orders.Abandon(ctx, c, order.ID, s.now().UTC(),
+			"checkout not completed within the reservation window")
+		return err
+	})
 }

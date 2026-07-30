@@ -183,3 +183,26 @@ func (c *Client) CreateCheckoutSession(ctx context.Context, account core.Account
 		ExpiresAt: time.Unix(created.ExpiresAt, 0).UTC(),
 	}, nil
 }
+
+// ExpireCheckoutSession makes a Checkout Session unpayable immediately.
+//
+// This is what lets the portal release inventory safely. Abandoning an order
+// while its hosted page stays payable — Stripe's default window is 24 hours —
+// would let a member pay for stock that had already been given to someone
+// else. Expiring first closes that window.
+//
+// It also fails usefully: Stripe refuses to expire a session that has already
+// completed, so an error here is the signal that the money arrived and the
+// order must NOT be abandoned. Fail-safe by construction rather than by a
+// check the caller has to remember.
+func (c *Client) ExpireCheckoutSession(ctx context.Context, account core.AccountRef, idempotencyKey, sessionID string) error {
+	base, err := c.mutationParams(account, idempotencyKey)
+	if err != nil {
+		return err
+	}
+	if _, err := c.sc.V1CheckoutSessions.Expire(ctx, sessionID,
+		&stripe.CheckoutSessionExpireParams{Params: base}); err != nil {
+		return fmt.Errorf("stripepay: expire session %s: %w", sessionID, err)
+	}
+	return nil
+}

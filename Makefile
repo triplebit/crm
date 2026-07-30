@@ -170,10 +170,18 @@ docker-check:
 # dependency.
 outdated:
 	@echo "== Go modules with newer versions =="
-	@$(GO) list -m -u -f '{{if .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{end}}' all \
-		| grep . || echo "  all current"
+	@# The lookup's exit status is preserved: piping it into grep would turn an
+	@# unreachable proxy into a cheerful "all current", which is the same
+	@# masking bug this file already fixed once in lint-cookie.
+	@out=$$($(GO) list -m -u -f '{{if .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{end}}' all) \
+		|| { echo "  module lookup FAILED; currency is unknown"; exit 1; }; \
+	if [ -n "$$(echo "$$out" | tr -d '[:space:]')" ]; then echo "$$out" | grep . ; \
+	else echo "  all current"; fi
 	@echo
-	@echo "== pinned container images (tag shown is what the digest resolved from) =="
+	@echo "== pinned images: verify these by hand against the sources below =="
+	@# Deliberately NOT a drift check. It lists what is pinned; comparing that
+	@# to upstream needs a query per registry, and a Makefile that half-does it
+	@# would be the kind of tool that looks like a control and is not.
 	@# The tag comment sits on the same line in compose/ci and on the line
 	@# above in a Dockerfile, because # is not a comment inside FROM. Both are
 	@# reported: an image this misses is an image nobody rechecks, which is the

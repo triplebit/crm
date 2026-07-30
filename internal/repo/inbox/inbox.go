@@ -11,6 +11,7 @@ package inbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -38,6 +39,22 @@ type Event struct {
 	Payload     []byte
 	Attempts    int
 	MaxAttempts int
+}
+
+// ObjectFromPayload decodes the event's object. The payload is verified — the
+// signature covered it — so reading it is safe; acting on it is not, which is
+// why the projector retrieves the canonical object before writing anything.
+// This exists only to read the identifiers that say what to retrieve.
+func (e Event) ObjectFromPayload() (map[string]any, error) {
+	var envelope struct {
+		Data struct {
+			Object map[string]any `json:"object"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(e.Payload, &envelope); err != nil {
+		return nil, fmt.Errorf("inbox: decode payload of %s: %w", e.StripeID, err)
+	}
+	return envelope.Data.Object, nil
 }
 
 // Receive stores a verified event, or reports that it was already stored.

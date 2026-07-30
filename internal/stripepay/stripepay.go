@@ -61,6 +61,11 @@ type Options struct {
 
 	// MaxResponseBytes defaults to DefaultMaxResponseBytes.
 	MaxResponseBytes int64
+
+	// Now defaults to time.Now. It stamps canonical retrievals, which is the
+	// ordering key the projection guard compares, so a test needs to control
+	// it.
+	Now func() time.Time
 }
 
 // Client wraps stripe-go behind an AccountRef-first API. Every method takes
@@ -69,6 +74,7 @@ type Options struct {
 type Client struct {
 	sc       *stripe.Client
 	accounts map[core.AccountRef]string
+	now      func() time.Time
 }
 
 // New validates the options and builds the client.
@@ -118,12 +124,17 @@ func New(opts Options) (*Client, error) {
 	}
 	sc := stripe.NewClient(opts.APIKey, stripe.WithBackends(stripe.NewBackendsWithConfig(cfg)))
 
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Client{
 		sc: sc,
 		accounts: map[core.AccountRef]string{
 			core.Memberships: opts.MembershipsAccountID,
 			core.Donations:   opts.DonationsAccountID,
 		},
+		now: now,
 	}, nil
 }
 

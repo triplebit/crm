@@ -47,6 +47,7 @@ type Server struct {
 
 	customers       map[string]map[string]any
 	sessions        map[string]map[string]any
+	subscriptions   map[string]map[string]any
 	customerOrigin  map[string]string // customer id → acct that created it
 	customerReads   map[string]int    // customer id + "|" + acct → reads so far
 	propagationLag  int               // sibling-account reads that 404 first
@@ -54,6 +55,7 @@ type Server struct {
 	failCustCreates int
 
 	creates      int
+	sessionGets  int
 	priceGets    int
 	productGets  int
 	customerGets int
@@ -73,6 +75,7 @@ func New(t *testing.T) *Server {
 		products:       map[string]map[string]any{},
 		customers:      map[string]map[string]any{},
 		sessions:       map[string]map[string]any{},
+		subscriptions:  map[string]map[string]any{},
 		customerOrigin: map[string]string{},
 		customerReads:  map[string]int{},
 	}
@@ -162,6 +165,55 @@ func (f *Server) Session(id, field string) string {
 		}
 	}
 	return ""
+}
+
+// SettleSession marks a session paid, as Stripe would after a card succeeds,
+// optionally attaching a subscription the projector will then retrieve.
+func (f *Server) SettleSession(id, paymentIntentID, subscriptionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.sessions[id]
+	if !ok {
+		return
+	}
+	obj["payment_status"] = "paid"
+	obj["status"] = "complete"
+	if paymentIntentID != "" {
+		obj["payment_intent"] = map[string]any{"id": paymentIntentID, "object": "payment_intent"}
+	}
+	if subscriptionID != "" {
+		obj["subscription"] = map[string]any{"id": subscriptionID, "object": "subscription"}
+		// The session's customer is already an expanded object; reuse it
+		// rather than wrapping it a second time.
+		f.subscriptions[subscriptionID] = map[string]any{
+			"id": subscriptionID, "object": "subscription", "status": "active",
+			"cancel_at_period_end": false,
+			"customer":             obj["customer"],
+			"items": map[string]any{"object": "list", "data": []any{map[string]any{
+				"id": "si_" + subscriptionID, "object": "subscription_item",
+				"current_period_end": 1900000000,
+				"price":              map[string]any{"id": "price_projected", "object": "price"},
+			}}},
+		}
+	}
+}
+
+// ExpireSession marks a session expired, as Stripe would after its window.
+func (f *Server) ExpireSession(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if obj, ok := f.sessions[id]; ok {
+		obj["status"] = "expired"
+		obj["payment_status"] = "unpaid"
+	}
+}
+
+// SessionGets counts canonical retrievals — the projector must read Stripe
+// rather than trust a payload, and this is how a test proves it did.
+func (f *Server) SessionGets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionGets
 }
 
 // SessionCount reports how many checkout sessions were created.
@@ -340,14 +392,38 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"id": id, "object": "checkout.session",
 			"url":                  f.server.URL + "/pay/" + id,
 			"mode":                 r.PostForm.Get("mode"),
-			"customer":             r.PostForm.Get("customer"),
+			"customer":             map[string]any{"id": r.PostForm.Get("customer"), "object": "customer"},
 			"client_reference_id":  r.PostForm.Get("client_reference_id"),
 			"payment_method_types": r.PostForm["payment_method_types[0]"],
 			"expires_at":           1900000000,
+			"status":               "open",
+			"payment_status":       "unpaid",
+			"currency":             "usd",
+			"amount_total":         0,
+		}
+		if r.PostForm.Get("shipping_address_collection[allowed_countries][0]") != "" {
+			obj["shipping_address_collection"] = map[string]any{
+				"allowed_countries": []any{r.PostForm.Get("shipping_address_collection[allowed_countries][0]")},
+			}
 		}
 		f.sessions[id] = obj
 		f.byIdem[idem] = obj
 		respond(obj)
+
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/checkout/sessions/"):
+		f.sessionGets++
+		if obj, ok := f.sessions[strings.TrimPrefix(r.URL.Path, "/v1/checkout/sessions/")]; ok {
+			respond(obj)
+			return
+		}
+		notFound(w, "checkout session")
+
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/subscriptions/"):
+		if obj, ok := f.subscriptions[strings.TrimPrefix(r.URL.Path, "/v1/subscriptions/")]; ok {
+			respond(obj)
+			return
+		}
+		notFound(w, "subscription")
 
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/customers/search":
 		// Matches only the metadata query EnsureCustomer's reconciliation

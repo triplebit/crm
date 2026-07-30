@@ -126,10 +126,14 @@ the tag was chosen from memory rather than checked. A floating tag is at least
 honestly out of date; a pinned stale version looks reviewed.
 **Decision.** Version numbers come from authoritative sources — the project's
 releases page, the registry's tag list, the module proxy — never from memory,
-and `make outdated` reports drift on demand. It is a report, not a merge gate,
+and `make outdated` supports that on demand: it *detects* Go module drift (the
+tooling exists) and *lists* the pinned images with their authoritative sources
+for a human to check (querying four registries from a Makefile would be a tool
+that resembles a control without being one). It is a report, not a merge gate,
 because a gate that fails when a third party publishes a release teaches people
 to ignore gates. **Consequence.** Upgrades are deliberate and dated. The
 Pocket ID v1→v2 jump this rule produced also surfaced two breaking changes that
 only running the software reveals: v2 requires its own `ENCRYPTION_KEY`, and
 the Postgres 18 image moved its data directory, refusing to start against the
-old mount rather than silently ignoring it.
+old mount rather than silently ignoring it. The volume is therefore named for
+its major version, so an upgrade never makes rollback a data-loss decision.
