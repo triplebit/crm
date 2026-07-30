@@ -3,15 +3,15 @@
 Progress tracker for the rebuild. Every milestone ends in a command a human runs
 whose output is the gate — never "wrote package X".
 
-**Status: M3 next.**
+**Status: M4 next.**
 
 | | Milestone | Gate | Status |
 |---|---|---|---|
 | M0 | Repo can prove itself | CI green on GitHub | ✅ done |
 | M1 | Schema, migrations, `WithTx` | migrate twice; 40 tables; real 40001 retried | ✅ done |
 | M2 | Leaf packages | their tests, plus layering clean | ✅ done |
-| M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ⬜ next |
-| M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ⬜ |
+| M3 | A real member can sign in | sign in through Pocket ID, land on `/account` | ✅ done |
+| M4 | The catalog is authoritative | `catalog-sync` against a Stripe sandbox | ⬜ next |
 | M5 | Money out | a real test card reaches Stripe Checkout | ⬜ |
 | M6 | Money in, durably | the order settles by itself, replay-safe | ⬜ |
 | M7 | Staff can fulfill | the launch sentence, one person, one sitting | ⬜ |
@@ -91,10 +91,21 @@ Ported `safeerr`, `cryptox`, `httpx` and the CSRF primitives; added `cookie`,
   every standard-library path, with compile-time proof each interface is
   implemented. Disclosure requires a greppable `.Reveal()`.
 
-### M3 — a real member can sign in
+### M3 — a real member can sign in ✅
 
-The milestone the previous implementation never reached. Also replaces its four
-sequential per-request database round trips with one statement.
+The milestone the previous implementation never reached: the owner signed in
+through Pocket ID with a passkey and landed on `/account` showing their own
+name, served by the compose stack.
+
+Highlights. Sessions replace four sequential per-request round trips with one
+statement. The OIDC login transaction is a server-side single-use row, so a
+replayed callback finds nothing to match. Scopes are a package constant —
+`groups` cannot be configured, so authorization stays in PostgreSQL. The
+router's mutating routes cannot be registered without session + CSRF (D8),
+proven by tests that iterate the route registry. A dropped rotation key fails
+loud instead of silently signing members out. And Pocket ID is addressed as
+`pocket-id.localhost` because WebAuthn refuses to register passkeys outside a
+secure context — a bug caught only by walking the real first-run setup.
 
 ### M4 — the catalog is authoritative
 
