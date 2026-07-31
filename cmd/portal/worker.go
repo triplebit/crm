@@ -13,6 +13,7 @@ import (
 	"triplebit.org/portal/internal/core"
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/repo/billing"
+	"triplebit.org/portal/internal/repo/customers"
 	"triplebit.org/portal/internal/repo/inbox"
 	"triplebit.org/portal/internal/repo/orders"
 	"triplebit.org/portal/internal/stripepay"
@@ -88,6 +89,7 @@ func runWorker(ctx context.Context, args []string) error {
 		Inbox:       inbox.New(),
 		Orders:      ordersRepo,
 		Billing:     billingRepo,
+		Customers:   customers.New(),
 		Pool:        pool,
 		Pay:         pay,
 		Environment: stripeEnv,

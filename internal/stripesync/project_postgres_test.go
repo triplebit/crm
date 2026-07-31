@@ -75,7 +75,8 @@ func newSettlement(t *testing.T, program string) *settlementFixture {
 	}
 	projector, err := stripesync.NewProjector(stripesync.ProjectorOptions{
 		Inbox: inbox.New(), Orders: orders.New(), Billing: billing.New(),
-		Pool: pool, Pay: pay, Environment: core.StripeSandbox,
+		Customers: customers.New(),
+		Pool:      pool, Pay: pay, Environment: core.StripeSandbox,
 	})
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)

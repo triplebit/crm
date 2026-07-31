@@ -13,6 +13,7 @@ import (
 	"triplebit.org/portal/internal/core"
 	"triplebit.org/portal/internal/db"
 	"triplebit.org/portal/internal/repo/billing"
+	"triplebit.org/portal/internal/repo/customers"
 	"triplebit.org/portal/internal/repo/inbox"
 	"triplebit.org/portal/internal/repo/orders"
 	"triplebit.org/portal/internal/stripepay"
@@ -63,13 +64,21 @@ var eventRouting = map[string]route{
 
 // Projector turns received webhook events into settled local state.
 type Projector struct {
-	inbox   *inbox.Repo
-	orders  *orders.Repo
-	billing *billing.Repo
-	pool    *db.Pool
-	pay     *stripepay.Client
-	env     core.StripeEnvironment
-	now     func() time.Time
+	inbox     *inbox.Repo
+	orders    *orders.Repo
+	billing   *billing.Repo
+	customers *customers.Repo
+	pool      *db.Pool
+	pay       *stripepay.Client
+	env       core.StripeEnvironment
+	now       func() time.Time
+
+	// pauseBeforeTx, when set, runs after an event's canonical Stripe reads and
+	// before its database transaction opens. That gap is where the cross-object
+	// ordering races live, and a test that cannot stand in it can only throw
+	// goroutines at the interleaving and hope. Test-only; see
+	// SetPauseBeforeTxForTest.
+	pauseBeforeTx func(inbox.Event)
 }
 
 // ProjectorOptions configures the projector. Everything is required except Now.
@@ -77,6 +86,7 @@ type ProjectorOptions struct {
 	Inbox       *inbox.Repo
 	Orders      *orders.Repo
 	Billing     *billing.Repo
+	Customers   *customers.Repo
 	Pool        *db.Pool
 	Pay         *stripepay.Client
 	Environment core.StripeEnvironment
@@ -92,6 +102,8 @@ func NewProjector(opts ProjectorOptions) (*Projector, error) {
 		return nil, errors.New("stripesync: an orders repository is required")
 	case opts.Billing == nil:
 		return nil, errors.New("stripesync: a billing repository is required")
+	case opts.Customers == nil:
+		return nil, errors.New("stripesync: a customers repository is required")
 	case opts.Pool == nil:
 		return nil, errors.New("stripesync: a database pool is required")
 	case opts.Pay == nil:
@@ -105,9 +117,17 @@ func NewProjector(opts ProjectorOptions) (*Projector, error) {
 	}
 	return &Projector{
 		inbox: opts.Inbox, orders: opts.Orders, billing: opts.Billing,
-		pool: opts.Pool, pay: opts.Pay, env: opts.Environment, now: now,
+		customers: opts.Customers,
+		pool:      opts.Pool, pay: opts.Pay, env: opts.Environment, now: now,
 	}, nil
 }
+
+// SetPauseBeforeTxForTest installs a hook that runs between an event's
+// canonical Stripe reads and its transaction. It exists so a concurrency test
+// can hold a projection at exactly the point where its observation can be
+// overtaken, instead of iterating goroutines and hoping to hit the window —
+// the same reason checkout has SetClockForTest.
+func (p *Projector) SetPauseBeforeTxForTest(fn func(inbox.Event)) { p.pauseBeforeTx = fn }
 
 // ProcessOne claims one due event and projects it, reporting whether there was
 // anything to do.
@@ -206,6 +226,10 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 	canonical, _ := json.Marshal(session)
 	signal := "no change"
 
+	if p.pauseBeforeTx != nil {
+		p.pauseBeforeTx(event)
+	}
+
 	// One transaction for every read AND every write that decides anything.
 	//
 	// The freshness check and the order read used to run on the pool, before
@@ -225,6 +249,20 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 	// must be able to surface its own failure. With an unnamed return the defer
 	// would assign to a local and the transaction would commit reporting success.
 	err = p.pool.WithTx(ctx, db.TxOptions{Lock: objectLock(p.env, event.Account, session.ID)}, func(c db.Conn) (err error) {
+		// When a subscription is in play, this transaction writes membership
+		// state derived from it, so it must serialize with the lifecycle path —
+		// which locks the SUBSCRIPTION, not the session. Without this second
+		// lock the two paths order their writes by two different names, which
+		// is the same as not ordering them: a lifecycle event could record a
+		// newer cancellation while this transaction was still free to commit an
+		// older "active". Lock order is fixed session-then-subscription, and
+		// the lifecycle path takes only the subscription's, so no cycle exists.
+		if subscription != nil {
+			if err := db.AdvisoryLock(ctx, c, objectLock(p.env, event.Account, subscription.ID)); err != nil {
+				return err
+			}
+		}
+
 		newer, err := p.billing.HasNewerObservation(ctx, c, p.env, event.Account,
 			session.ID, session.RetrievedAt)
 		if err != nil {
@@ -235,6 +273,27 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 			// this one would move settled state backwards.
 			signal = "superseded by a newer observation"
 			return p.record(ctx, c, event, signal, session.ID, nil, session.RetrievedAt, nil)
+		}
+
+		// The same question for the subscription read this transaction would
+		// write membership state from. The read happened before the transaction
+		// (Stripe I/O stays outside — WithTx's contract), so between the read
+		// and this lock a lifecycle event may have applied a newer observation:
+		// a cancellation, a status change, a fresher period. Granting from the
+		// older read would overwrite it with no repair left, because the newer
+		// event is already recorded and Stripe will not resend it. Failing here
+		// returns the event to the inbox, and the retry re-retrieves.
+		if subscription != nil {
+			superseded, err := p.billing.HasNewerObservation(ctx, c, p.env, event.Account,
+				subscription.ID, subscription.RetrievedAt)
+			if err != nil {
+				return err
+			}
+			if superseded {
+				return fmt.Errorf("stripesync: the canonical read of subscription %s for session %s "+
+					"was superseded by a newer observation before it could be applied; "+
+					"the retry will re-retrieve", subscription.ID, session.ID)
+			}
 		}
 
 		order, err := p.orders.ByCheckoutSession(ctx, c, p.env, event.Account, session.ID)
@@ -289,6 +348,27 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 						order.ID, mismatch, session.ID), p.now().UTC())
 			}
 
+			// Identity next, and just as fail-closed: a right amount from the
+			// wrong customer, or a subscription on the wrong price, is not the
+			// order settling — it is someone else's money or someone else's
+			// terms wearing this order's session. The expected customer is a
+			// local read, so it lives inside the transaction with everything
+			// else that decides.
+			expectedCustomer, err := p.customers.CustomerIDFor(ctx, c, order.UserID, p.env, order.Account)
+			if err != nil && !errors.Is(err, db.ErrNotFound) {
+				return err
+			}
+			if mismatch := identityMismatch(lines, session, subscription, expectedCustomer); mismatch != "" {
+				signal = "identity does not match the order; escalated"
+				return p.billing.RaiseAlert(ctx, c, p.env, event.Account,
+					"settlement_identity_mismatch", "order:"+order.ID.String(),
+					"Stripe's records do not match the order's identity",
+					fmt.Sprintf("Order %s was NOT settled and nothing was granted. %s. "+
+						"Session %s. Confirm who paid and what subscription terms Stripe "+
+						"holds, then settle or refund by hand.",
+						order.ID, mismatch, session.ID), p.now().UTC())
+			}
+
 			settled, err := p.orders.Settle(ctx, c, order.ID,
 				session.PaymentIntentID, session.SubscriptionID, session.InvoiceID, p.now().UTC())
 			if err != nil {
@@ -322,6 +402,20 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 			}
 			if err := p.write(ctx, c, order, session, lines, subscription); err != nil {
 				return err
+			}
+			if subscription != nil {
+				// The membership state written above came from this canonical
+				// subscription observation, so the observation is recorded in
+				// the SUBSCRIPTION's ordering domain as well as the session's.
+				// This is the other half of the single-ordering-domain rule: a
+				// lifecycle event holding an older canonical read must find
+				// this row and refuse itself, exactly as this transaction
+				// would have refused a stale read of its own.
+				subCanonical, _ := json.Marshal(subscription)
+				if err := p.record(ctx, c, event, signal, subscription.ID, &order.ID,
+					subscription.RetrievedAt, subCanonical); err != nil {
+					return err
+				}
 			}
 		}
 		return nil // The deferred record above writes the application row.
@@ -477,6 +571,71 @@ func moneyMismatch(order orders.Order, lines []orders.Line, session stripepay.Ca
 	return ""
 }
 
+// identityMismatch compares who Stripe says paid, and what recurring terms it
+// holds, against what this order expects — returning a human-readable
+// description of the first disagreement or "" when they agree.
+//
+// moneyMismatch answers "is this the right amount?"; this answers "is it the
+// right people and the right subscription?". Both are fail-closed for the same
+// reason: refusing a legitimate settlement pages a human and is recoverable,
+// while granting access bound to someone else's Stripe customer — or to a
+// subscription that will renew on terms nobody froze — is not. The concrete
+// failures each check refuses:
+//
+//   - expectedCustomer: the customer recorded when this member's checkout was
+//     created, for this environment and account. A session paid by any other
+//     customer is someone else's payment wearing this order's reference.
+//   - subscription customer: the subscription must belong to the same customer
+//     as the session that sold it, or the access lifecycle — renewals,
+//     cancellation — is bound to a different Stripe identity than the payment.
+//   - subscription price: for a catalog tier the frozen line names the exact
+//     Stripe price the member agreed to. A different price with the same
+//     amount settles the same money today and renews on unfrozen terms
+//     tomorrow, which is why amount equality alone cannot stand in for it.
+//
+// The one deliberate gap: a custom-amount Friends line has no catalog price —
+// the member set the amount, the frozen line IS the record, and Stripe mints
+// an ad-hoc price object from the inline price_data whose id nothing local
+// ever knew. For that line the price comparison is defined as vacuous; the
+// amount was already compared against the frozen line by moneyMismatch, and
+// the customer checks above still apply in full.
+func identityMismatch(lines []orders.Line, session stripepay.CanonicalSession,
+	subscription *stripepay.CanonicalSubscription, expectedCustomer string,
+) string {
+	if expectedCustomer == "" {
+		return "No Stripe customer is recorded locally for this member in this account, " +
+			"so the session's customer " + session.CustomerID + " cannot be verified"
+	}
+	if session.CustomerID != expectedCustomer {
+		return fmt.Sprintf("Stripe's session was paid by customer %s but this member's "+
+			"recorded customer is %s", session.CustomerID, expectedCustomer)
+	}
+	if subscription == nil {
+		return ""
+	}
+	if subscription.CustomerID != session.CustomerID {
+		return fmt.Sprintf("Stripe's subscription belongs to customer %s but the session's "+
+			"customer is %s", subscription.CustomerID, session.CustomerID)
+	}
+	for _, line := range lines {
+		if line.Kind != "hotspot_tier" && line.Kind != "friends_tier" {
+			continue
+		}
+		if line.CatalogPriceVersionID == uuid.Nil {
+			// The custom-amount Friends path: no catalog price anchors the
+			// member's own number, so there is nothing to compare the ad-hoc
+			// inline price against. Defined as valid, not overlooked.
+			break
+		}
+		if subscription.PriceID != line.StripePriceID {
+			return fmt.Sprintf("Stripe's subscription is on price %s but the frozen tier "+
+				"line sold price %s", subscription.PriceID, line.StripePriceID)
+		}
+		break
+	}
+	return ""
+}
+
 // projectSubscription applies the recurring lifecycle: a renewal advances the
 // membership's period, a cancellation revokes it, a status change records it.
 //
@@ -517,6 +676,10 @@ func (p *Projector) projectSubscription(ctx context.Context, event inbox.Event) 
 	if !subscription.CurrentPeriodEnd.IsZero() {
 		end := subscription.CurrentPeriodEnd
 		periodEnd = &end
+	}
+
+	if p.pauseBeforeTx != nil {
+		p.pauseBeforeTx(event)
 	}
 
 	// Same shape as the session path, for the same reason: the freshness check

@@ -93,6 +93,22 @@ func (p *Pool) runOnce(ctx context.Context, iso pgx.TxIsoLevel, lock string, fn 
 	return nil
 }
 
+// AdvisoryLock takes the same transaction-scoped advisory lock TxOptions.Lock
+// would take, on a transaction already in flight. It exists for the one caller
+// that must serialize on TWO names: paid-session settlement holds the Checkout
+// Session's lock via TxOptions and additionally takes the Subscription's, so
+// its membership write and the subscription lifecycle path share one ordering
+// domain. Lock order is fixed — session first, then subscription — and the
+// lifecycle path takes only the subscription's, so the acquisitions cannot
+// form a cycle.
+func AdvisoryLock(ctx context.Context, c Conn, name string) error {
+	if _, err := c.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, name); err != nil {
+		return fmt.Errorf("acquire advisory lock %q: %w", name, err)
+	}
+	return nil
+}
+
 // backoff waits before the next attempt, respecting context cancellation.
 // Full jitter, because retrying contended transactions in lockstep just
 // reproduces the contention.

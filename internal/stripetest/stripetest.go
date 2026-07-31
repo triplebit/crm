@@ -56,11 +56,13 @@ type Server struct {
 	customers       map[string]map[string]any
 	sessions        map[string]map[string]any
 	subscriptions   map[string]map[string]any
+	sessionTierPref map[string]string // session id → the recurring price it sold
 	customerOrigin  map[string]string // customer id → acct that created it
 	customerReads   map[string]int    // customer id + "|" + acct → reads so far
 	propagationLag  int               // sibling-account reads that 404 first
 	failDeactivate  int
 	failCustCreates int
+	adhocPrices     int // its own counter, so Creates() keeps meaning "objects tests asked for"
 
 	creates      int
 	sessionGets  int
@@ -79,17 +81,18 @@ func New(t *testing.T) *Server {
 		t.Fatalf("stripetest: read random prefix: %v", err)
 	}
 	f := &Server{
-		prefix:         hex.EncodeToString(raw),
-		byIdem:         map[string]map[string]any{},
-		byIdemSig:      map[string]string{},
-		byIdemErr:      map[string]int{},
-		prices:         map[string]map[string]any{},
-		products:       map[string]map[string]any{},
-		customers:      map[string]map[string]any{},
-		sessions:       map[string]map[string]any{},
-		subscriptions:  map[string]map[string]any{},
-		customerOrigin: map[string]string{},
-		customerReads:  map[string]int{},
+		prefix:          hex.EncodeToString(raw),
+		byIdem:          map[string]map[string]any{},
+		byIdemSig:       map[string]string{},
+		byIdemErr:       map[string]int{},
+		prices:          map[string]map[string]any{},
+		products:        map[string]map[string]any{},
+		customers:       map[string]map[string]any{},
+		sessions:        map[string]map[string]any{},
+		subscriptions:   map[string]map[string]any{},
+		sessionTierPref: map[string]string{},
+		customerOrigin:  map[string]string{},
+		customerReads:   map[string]int{},
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.server.Close)
@@ -195,6 +198,15 @@ func (f *Server) SettleSession(id, paymentIntentID, subscriptionID string) {
 	}
 	if subscriptionID != "" {
 		obj["subscription"] = map[string]any{"id": subscriptionID, "object": "subscription"}
+		// The subscription's price is the recurring price the session actually
+		// sold, remembered at session creation. It used to be a hardcoded
+		// "price_projected" — a fake that could never disagree with the frozen
+		// order line, which is exactly why nothing noticed the projector never
+		// compared the subscription's price at all.
+		priceID := f.sessionTierPref[id]
+		if priceID == "" {
+			priceID = "price_projected"
+		}
 		// The session's customer is already an expanded object; reuse it
 		// rather than wrapping it a second time.
 		f.subscriptions[subscriptionID] = map[string]any{
@@ -204,10 +216,46 @@ func (f *Server) SettleSession(id, paymentIntentID, subscriptionID string) {
 			"items": map[string]any{"object": "list", "data": []any{map[string]any{
 				"id": "si_" + subscriptionID, "object": "subscription_item",
 				"current_period_end": 1900000000,
-				"price":              map[string]any{"id": "price_projected", "object": "price"},
+				"price":              map[string]any{"id": priceID, "object": "price"},
 			}}},
 		}
 	}
+}
+
+// SetSubscriptionPrice overrides a stored subscription's price, so a test can
+// make Stripe report different recurring terms — same amount or not — than the
+// frozen order line sold. Nothing in the portal can cause this; it exists to
+// prove the identity check fires when the impossible happens.
+func (f *Server) SetSubscriptionPrice(id, priceID string) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		items, _ := obj["items"].(map[string]any)
+		data, _ := items["data"].([]any)
+		if len(data) > 0 {
+			if item, ok := data[0].(map[string]any); ok {
+				item["price"] = map[string]any{"id": priceID, "object": "price"}
+			}
+		}
+	})
+}
+
+// SetSubscriptionCustomer overrides who a stored subscription belongs to, so a
+// test can make Stripe bind the recurring lifecycle to somebody else.
+func (f *Server) SetSubscriptionCustomer(id, customerID string) bool {
+	return f.mutateSubscription(id, func(obj map[string]any) {
+		obj["customer"] = map[string]any{"id": customerID, "object": "customer"}
+	})
+}
+
+// SetSessionCustomer overrides who a stored checkout session says paid.
+func (f *Server) SetSessionCustomer(id, customerID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obj, ok := f.sessions[id]
+	if !ok {
+		return false
+	}
+	obj["customer"] = map[string]any{"id": customerID, "object": "customer"}
+	return true
 }
 
 // RenewSubscription moves a subscription's period forward, as Stripe does when a
@@ -487,6 +535,9 @@ func (f *Server) handle(w http.ResponseWriter, r *http.Request) {
 				"allowed_countries": []any{r.PostForm.Get("shipping_address_collection[allowed_countries][0]")},
 			}
 		}
+		if r.PostForm.Get("mode") == "subscription" {
+			f.sessionTierPref[id] = f.recurringPriceFor(r)
+		}
 		f.sessions[id] = obj
 		f.byIdem[idem] = obj
 		respond(obj)
@@ -616,6 +667,57 @@ func (f *Server) lineItemTotal(r *http.Request) (int64, string) {
 		}
 	}
 	return total, currency
+}
+
+// recurringPriceFor decides which price a subscription created from this
+// session would carry, the way Stripe does: the recurring line's price. A
+// price submitted by id wins when the fake knows it is recurring; an inline
+// price_data with a recurring interval becomes an ad-hoc Price object with a
+// freshly minted id, because that is what Stripe really does with price_data —
+// the subscription then reports an id nothing local has ever stored, which is
+// exactly the property the custom-donation identity rule has to survive. When
+// neither is recognisable (fixtures seed prices without recurrence metadata),
+// the first line's price stands in, since a subscription-mode session sells
+// its recurring line first in this portal.
+//
+// Caller holds f.mu.
+func (f *Server) recurringPriceFor(r *http.Request) string {
+	fallback := ""
+	for i := 0; ; i++ {
+		prefix := fmt.Sprintf("line_items[%d]", i)
+		priceID := r.PostForm.Get(prefix + "[price]")
+		inlineAmount := r.PostForm.Get(prefix + "[price_data][unit_amount]")
+		if priceID == "" && inlineAmount == "" {
+			break
+		}
+		switch {
+		case priceID != "":
+			if price, ok := f.prices[priceID]; ok && price["recurring"] != nil {
+				return priceID
+			}
+			if fallback == "" {
+				fallback = priceID
+			}
+		case r.PostForm.Get(prefix+"[price_data][recurring][interval]") != "":
+			f.adhocPrices++
+			adhoc := fmt.Sprintf("price_adhoc%s%d", f.prefix, f.adhocPrices)
+			var amount int64
+			_, _ = fmt.Sscan(inlineAmount, &amount)
+			currency := r.PostForm.Get(prefix + "[price_data][currency]")
+			if currency == "" {
+				currency = "usd"
+			}
+			f.prices[adhoc] = map[string]any{
+				"id": adhoc, "object": "price", "active": true,
+				"unit_amount": amount, "currency": currency,
+				"recurring": map[string]any{
+					"interval": r.PostForm.Get(prefix + "[price_data][recurring][interval]"),
+				},
+			}
+			return adhoc
+		}
+	}
+	return fallback
 }
 
 // SeedPrice registers a price this fake will recognise, for fixtures that write

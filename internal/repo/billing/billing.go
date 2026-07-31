@@ -69,9 +69,16 @@ func (r *Repo) HasNewerObservation(ctx context.Context, q db.Conn, env core.Stri
 }
 
 // RecordApplication stores that an observation was applied. The unique index
-// on (environment, account_ref, stripe_event_id) makes a replayed event a
-// no-op rather than a second projection, so the caller can treat a false
-// return as "already done".
+// on (environment, account_ref, stripe_event_id, object_id) makes a replayed
+// event a no-op per object rather than a second projection, so the caller can
+// treat a false return as "already done".
+//
+// Object id is part of the key because one settlement event legitimately
+// applies to two objects: the Checkout Session it names, and the Subscription
+// its membership write was derived from. Recording both is what gives every
+// Subscription-derived membership write one ordering domain — the lifecycle
+// path's out-of-order guard asks about the subscription's object id, and an
+// observation settlement wrote must be visible to that question.
 func (r *Repo) RecordApplication(ctx context.Context, q db.Conn, a Application) (bool, error) {
 	canonical := a.Canonical
 	if len(canonical) == 0 {
@@ -82,7 +89,7 @@ func (r *Repo) RecordApplication(ctx context.Context, q db.Conn, a Application) 
 			id, environment, account_ref, stripe_event_id, event_type, signal,
 			object_id, order_id, observed_at, canonical
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (environment, account_ref, stripe_event_id) DO NOTHING
+		ON CONFLICT (environment, account_ref, stripe_event_id, object_id) DO NOTHING
 	`, uuid.New(), a.Environment.String(), a.Account.String(), a.StripeEvent,
 		a.EventType, a.Signal, a.ObjectID, a.OrderID, a.ObservedAt, canonical)
 	if err != nil {
