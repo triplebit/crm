@@ -108,11 +108,22 @@ func TestEnsureIntentReportsFreshness(t *testing.T) {
 // actually produces by double-clicking Enroll, where several requests record
 // the same observation at once. The row violates two unique constraints when it
 // already exists — the ON CONFLICT arbiter, and the table's UNIQUE
-// (environment, account_ref, customer_id) — and this asserts the arbiter
-// absorbs the race rather than the other constraint raising.
+// (environment, account_ref, customer_id) — and PostgreSQL's ON CONFLICT only
+// absorbs conflicts on its ARBITER. The first inserter writes its index
+// entries one at a time, the customer-id key's first; a second inserter whose
+// arbiter pre-check lands in the gap between them misses the arbiter, then
+// trips over the first entry and raises 23505 on
+// stripe_customers_environment_account_ref_customer_id_key.
 //
-// Sixteen goroutines writing the same observation: one inserts, fifteen must
-// find it already there and say so quietly.
+// That is the exact failure CI produced in run 30580126989 and again on
+// e6c1273's run — one person, one fake, no id collision required. The original
+// forensics attributed it to two fakes minting one customer id, a hypothesis
+// this test's single round could neither confirm nor refute because the loss
+// window is microseconds. It now runs enough rounds to hit the window reliably
+// (a hammer reproduced the pre-fix failure within a handful of rounds), so it
+// fails against the unfixed RecordCustomer instead of flaking once a month in
+// CI. RecordCustomer absorbs the collision by re-reading the row: same owner,
+// same customer means the fact is durably recorded and the call succeeded.
 func TestConcurrentIdenticalObservationsAllSucceed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -120,42 +131,80 @@ func TestConcurrentIdenticalObservationsAllSucceed(t *testing.T) {
 	repo := customers.New()
 	userID := seedUser(t, pool)
 	now := time.Now().UTC()
-	customerID := "cus_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 
-	const writers = 16
-	start := make(chan struct{})
-	errs := make(chan error, writers)
-	var wg sync.WaitGroup
-	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start // Release them together, to make the race likely.
-			errs <- repo.RecordCustomer(ctx, pool.Conn(), userID,
-				core.StripeSandbox, core.Memberships, customerID, now)
-		}()
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
+	const writers, rounds = 8, 150
+	for round := range rounds {
+		customerID := "cus_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		start := make(chan struct{})
+		errs := make(chan error, writers)
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // Release them together, to make the race likely.
+				errs <- repo.RecordCustomer(ctx, pool.Conn(), userID,
+					core.StripeSandbox, core.Memberships, customerID, now)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
 
-	for err := range errs {
-		if err != nil {
-			t.Errorf("a concurrent identical observation failed: %v", err)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: a concurrent identical observation failed: %v", round, err)
+			}
+		}
+
+		// Exactly one row, and it is the observation everybody made.
+		var rows int
+		if err := pool.Conn().QueryRow(ctx,
+			`SELECT count(*) FROM stripe_customers WHERE user_id = $1`, userID).Scan(&rows); err != nil {
+			t.Fatalf("round %d: count rows: %v", round, err)
+		}
+		if rows != 1 {
+			t.Fatalf("round %d: %d rows for one person in one account, want 1", round, rows)
+		}
+		got, err := repo.CustomerIDFor(ctx, pool.Conn(), userID, core.StripeSandbox, core.Memberships)
+		if err != nil || got != customerID {
+			t.Fatalf("round %d: stored customer = %q (%v), want %q", round, got, err, customerID)
+		}
+		// A fresh customer id per round needs a fresh slate; the cleanup error
+		// is checked because a silently failing DELETE is how this project
+		// once leaked rows for weeks.
+		if _, err := pool.Conn().Exec(ctx,
+			`DELETE FROM stripe_customers WHERE user_id = $1`, userID); err != nil {
+			t.Fatalf("round %d: cleanup: %v", round, err)
 		}
 	}
+}
 
-	// Exactly one row, and it is the observation everybody made.
-	var rows int
-	if err := pool.Conn().QueryRow(ctx,
-		`SELECT count(*) FROM stripe_customers WHERE user_id = $1`, userID).Scan(&rows); err != nil {
-		t.Fatalf("count rows: %v", err)
+// A collision with somebody ELSE holding the customer id stays loud — and now
+// names the owner. The original CI forensics stalled precisely because the
+// error preserved only the constraint name: fake-id collision, cleanup leak,
+// and the benign same-user race above all produce identical output without
+// the owning row's identity. This is the diagnostic that was missing.
+func TestCrossUserCustomerCollisionNamesTheOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	repo := customers.New()
+	first := seedUser(t, pool)
+	second := seedUser(t, pool)
+	now := time.Now().UTC()
+	customerID := "cus_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+
+	if err := repo.RecordCustomer(ctx, pool.Conn(), first, core.StripeSandbox, core.Memberships, customerID, now); err != nil {
+		t.Fatalf("first user's observation: %v", err)
 	}
-	if rows != 1 {
-		t.Errorf("%d rows for one person in one account, want 1", rows)
+	err := repo.RecordCustomer(ctx, pool.Conn(), second, core.StripeSandbox, core.Memberships, customerID, now)
+	if err == nil {
+		t.Fatal("a second user recorded somebody else's Stripe customer without complaint")
 	}
-	got, err := repo.CustomerIDFor(ctx, pool.Conn(), userID, core.StripeSandbox, core.Memberships)
-	if err != nil || got != customerID {
-		t.Errorf("stored customer = %q (%v), want %q", got, err, customerID)
+	for _, want := range []string{customerID, first.String(), second.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q; an unattributable conflict is what made the CI failure undiagnosable", err, want)
+		}
 	}
 }

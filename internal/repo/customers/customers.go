@@ -131,6 +131,46 @@ func (r *Repo) RecordCustomer(ctx context.Context, q db.Conn, userID uuid.UUID, 
 			DO UPDATE SET customer_id = stripe_customers.customer_id
 			WHERE stripe_customers.customer_id = EXCLUDED.customer_id
 	`, uuid.New(), userID, env.String(), account.String(), customerID, at)
+	if db.ConstraintOf(db.Normalize(err)) == "stripe_customers_environment_account_ref_customer_id_key" {
+		// ON CONFLICT only absorbs conflicts on its ARBITER index. Two truly
+		// simultaneous inserts of the SAME row can still collide on this other
+		// unique key: the first inserter writes its index entries one at a
+		// time — this constraint's index first, the arbiter's second — and the
+		// second inserter's arbiter pre-check can land in the gap between
+		// them. It then misses the arbiter, proceeds, and trips over the first
+		// inserter's entry here. Demonstrated with a 4-goroutine hammer, which
+		// reproduces within a handful of rounds; in CI it surfaced roughly
+		// once in dozens of runs and was misattributed to a fake-id collision
+		// (see the m6-review-findings CI forensics — the constraint alone
+		// cannot distinguish the two, which is why this re-read also names
+		// the row's actual owner).
+		//
+		// The re-read classifies the collision. The same person holding the
+		// same customer is the benign race above: the fact this call wanted
+		// to record is durably recorded, so this call succeeded in every way
+		// that matters. Anyone else holding it is the cross-user invariant
+		// violation, reported with the owner named — the diagnostic whose
+		// absence made the original CI failure unattributable.
+		var ownerUser, ownerGuest *uuid.UUID
+		if readErr := q.QueryRow(ctx, `
+			SELECT user_id, guest_id FROM stripe_customers
+			WHERE environment = $1 AND account_ref = $2 AND customer_id = $3
+		`, env.String(), account.String(), customerID).Scan(&ownerUser, &ownerGuest); readErr != nil {
+			return fmt.Errorf("customers: record customer: %w (and identifying the conflicting owner failed: %v)",
+				db.Normalize(err), readErr)
+		}
+		if ownerUser != nil && *ownerUser == userID {
+			return nil
+		}
+		owner := "guest"
+		if ownerUser != nil {
+			owner = "user " + ownerUser.String()
+		} else if ownerGuest != nil {
+			owner = "guest " + ownerGuest.String()
+		}
+		return fmt.Errorf("customers: Stripe customer %s in %s/%s already belongs to %s, not user %s",
+			customerID, env.String(), account.String(), owner, userID)
+	}
 	if err != nil {
 		return fmt.Errorf("customers: record customer: %w", db.Normalize(err))
 	}
