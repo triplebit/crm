@@ -67,7 +67,30 @@ func (m Middleware) requestID(next http.Handler) http.Handler {
 func (m Middleware) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
-		csp := "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'"
+		// form-action allows Stripe's hosted Checkout page, and only that.
+		//
+		// It has to. Enrolling POSTs to /enroll, which answers 303 to the
+		// Checkout URL — and browsers enforce form-action across the whole
+		// redirect chain of a form submission, not just its immediate action. So
+		// `form-action 'self'` blocked every payment with "Sending form data to
+		// 'http://localhost:8080/enroll' violates ... form-action 'self'", a
+		// message that names the local URL and gives no hint that the real refusal
+		// is one hop later.
+		//
+		// The host is verified, not remembered: a real sandbox Checkout Session's
+		// `url` resolves to https://checkout.stripe.com. Stripe documents the
+		// connect/frame/script/img hosts for Checkout but not form-action, because
+		// their embedded integration never submits a form off-site; the hosted
+		// redirect this portal uses does.
+		//
+		// Deliberately one exact host, no wildcard: *.stripe.com would license
+		// form submissions to every Stripe subdomain forever. If Stripe ever moves
+		// Checkout, this breaks loudly in the browser console rather than silently
+		// widening.
+		const stripeCheckout = "https://checkout.stripe.com"
+		csp := "default-src 'self'; base-uri 'self'; object-src 'none'; " +
+			"frame-ancestors 'none'; form-action 'self' " + stripeCheckout + "; " +
+			"img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'"
 		if m.Production {
 			csp += "; upgrade-insecure-requests"
 		}

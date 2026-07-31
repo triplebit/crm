@@ -386,3 +386,41 @@ func TestRequireSameOriginFailsClosedOnEmptyBase(t *testing.T) {
 		t.Fatalf("empty base URL: status %d, want 403", w.Code)
 	}
 }
+
+// The CSP must permit exactly one off-site form destination: Stripe's hosted
+// Checkout page.
+//
+// This is a load-bearing exception, so it is asserted rather than assumed.
+// Enrolling POSTs to /enroll, which answers 303 to the Checkout URL, and
+// browsers enforce form-action across a form submission's whole redirect chain —
+// so `form-action 'self'` blocked every payment, reporting the LOCAL url and
+// giving no hint the real refusal was one hop later. A test that only checked
+// the header was non-empty could not see it.
+func TestCSPAllowsStripeCheckoutForFormsAndNothingElse(t *testing.T) {
+	t.Parallel()
+	handler := (Middleware{Production: true}).Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	csp := response.Header().Get("Content-Security-Policy")
+
+	if !strings.Contains(csp, "form-action 'self' https://checkout.stripe.com;") {
+		t.Errorf("form-action does not permit Stripe Checkout, so paying is impossible: %s", csp)
+	}
+	// One exact host. A wildcard would license form submissions to every Stripe
+	// subdomain, forever, for the sake of one redirect.
+	if strings.Contains(csp, "*.stripe.com") {
+		t.Errorf("form-action was widened to a wildcard: %s", csp)
+	}
+	// The exception must not have leaked into the directives that keep scripts,
+	// framing and data exfiltration locked down.
+	for _, directive := range []string{
+		"default-src 'self'", "script-src 'self'", "connect-src 'self'",
+		"object-src 'none'", "frame-ancestors 'none'", "base-uri 'self'",
+	} {
+		if !strings.Contains(csp, directive) {
+			t.Errorf("%q is missing from the policy: %s", directive, csp)
+		}
+	}
+}
