@@ -19,9 +19,22 @@ import (
 	"triplebit.org/portal/internal/stripepay"
 )
 
-// maxFormBytes bounds every request body. The largest legitimate body this
-// portal receives is a small form; anything bigger is a mistake or an attack.
+// maxFormBytes bounds every browser-facing request body. The largest
+// legitimate body this portal receives from a browser is a small form;
+// anything bigger is a mistake or an attack.
 const maxFormBytes = 64 << 10
+
+// maxWebhookBytes bounds a Stripe webhook body, separately and higher, because
+// the form cap silently applied to webhooks too and nothing documents that
+// every subscribed event stays under 64 KiB. The failure mode of an undersized
+// cap is severe and quiet: the read fails, the handler answers 500, Stripe
+// retries for three days, and the event is then lost with only log lines — no
+// dead letter, because nothing was ever stored. Our subscribed event types
+// carry a single API object and are observed well under 64 KiB, so 1 MiB is
+// ~16x headroom against payload growth while still bounding what an
+// unauthenticated peer can make this handler buffer before signature
+// verification refuses it.
+const maxWebhookBytes = 1 << 20
 
 // Options configures the server. Everything is required unless noted.
 type Options struct {
@@ -163,7 +176,7 @@ func New(opts Options) (http.Handler, error) {
 	// webhook — which the registrar and its tests already constrain. Writing
 	// the paths twice is how the two drift apart.
 	var root http.Handler = s.mux
-	root = httpx.LimitBody(root, maxFormBytes)
+	root = s.limitBodies(root)
 	root = httpx.RequireSameOrigin(opts.BaseURL.String(), s.webhookPaths(), root)
 	if s.trustProxy {
 		root, err = httpx.TrustProxyHeaders(opts.TrustedProxyCIDRs, root)
@@ -173,4 +186,25 @@ func New(opts Options) (http.Handler, error) {
 	}
 	root = httpx.Middleware{Logger: logger, Production: opts.Production}.Wrap(root)
 	return root, nil
+}
+
+// limitBodies applies the body cap each path deserves: the webhook cap on the
+// webhook endpoints, the form cap everywhere else. The webhook set is derived
+// from the route registry, same as the same-origin exemption below it, so a
+// path can only get the larger cap by having been registered as a webhook.
+func (s *Server) limitBodies(next http.Handler) http.Handler {
+	webhook := make(map[string]bool)
+	for _, path := range s.webhookPaths() {
+		webhook[path] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := int64(maxFormBytes)
+		if webhook[r.URL.Path] {
+			limit = maxWebhookBytes
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
 }

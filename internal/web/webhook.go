@@ -29,16 +29,22 @@ func webhookPath(account core.AccountRef) string {
 // worker projects from the inbox at its own pace, which is also what makes
 // replay safe — the event is on disk before anything acts on it.
 //
-// Status codes are the retry protocol, so each one is chosen for what it makes
-// Stripe do:
+// Status codes: Stripe retries ANY non-2xx response with exponential backoff —
+// for up to three days in live mode — so no code can tell it to give up, and
+// choosing between 400 and 500 changes nothing about redelivery. (An earlier
+// version of this comment claimed 400 stopped retries; it does not, and status
+// decisions reasoned from that premise would be wrong.) What each code is for:
 //
-//   - 400, unverifiable: Stripe should not retry, because nothing will change.
-//     A forged or misconfigured delivery is not a transient failure.
-//   - 500, stored badly: Stripe should retry, because the database was the
-//     problem and the next attempt may find it healthy.
-//   - 200, stored (or already present): stop delivering. A duplicate is a
-//     success — the inbox is keyed on the event id, and Stripe retries the same
-//     id, so "already have it" is the normal happy path for a retry.
+//   - 400, unverifiable: a deliberate refusal. Stripe retries it anyway, and
+//     every retry of a forged or misconfigured delivery fails identically —
+//     the code exists for the operator reading logs, not as a signal to Stripe.
+//   - 500, stored badly: the database was the problem and a later attempt may
+//     find it healthy. Indistinguishable from 400 on Stripe's side; the
+//     distinction is honesty about whose fault the failure was.
+//   - 200, stored (or already present): the only answer that stops delivery.
+//     A duplicate is a success — the inbox is keyed on the event id, and
+//     Stripe retries the same id, so "already have it" is the normal happy
+//     path for a retry.
 func (s *Server) stripeWebhook(account core.AccountRef) handler {
 	return func(c *reqctx) error {
 		// The body is read once and kept verbatim: the signature covers these
@@ -46,9 +52,11 @@ func (s *Server) stripeWebhook(account core.AccountRef) handler {
 		// re-derived later from what Stripe actually said.
 		body, err := io.ReadAll(c.r.Body)
 		if err != nil {
-			// Includes the body cap being hit. Refusing with 400 would tell
-			// Stripe to give up on an event that is probably genuine, so this
-			// is a 500: retry, and let the failure be visible.
+			// Includes the webhook body cap being hit. The status changes
+			// nothing about redelivery — Stripe retries any non-2xx — so 500
+			// is chosen for honesty: the refusal is ours, the event may well
+			// be genuine, and the failure must stay visible in the logs while
+			// Stripe keeps trying.
 			s.logger.ErrorContext(c.r.Context(), "reading a webhook body failed",
 				slog.String("account", account.String()), slog.String("error", err.Error()))
 			http.Error(c.w, "could not read the request body", http.StatusInternalServerError)

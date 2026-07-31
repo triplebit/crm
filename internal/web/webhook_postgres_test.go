@@ -38,7 +38,7 @@ const (
 func deliver(t *testing.T, s *Server, account core.AccountRef, secret string, body []byte, at time.Time) *httptest.ResponseRecorder {
 	t.Helper()
 	var root http.Handler = s.mux
-	root = httpx.LimitBody(root, maxFormBytes)
+	root = s.limitBodies(root)
 	root = httpx.RequireSameOrigin("http://portal.test", s.webhookPaths(), root)
 
 	r := httptest.NewRequest(http.MethodPost, "http://portal.test"+webhookPath(account),
@@ -247,5 +247,60 @@ func TestTwoDifferentEventsAreBothStored(t *testing.T) {
 	}
 	if distinctRowIDs != 2 {
 		t.Errorf("%d distinct row ids for 2 events; the handler is reusing one", distinctRowIDs)
+	}
+}
+
+// webEventBodyPadded is a genuine, signable event inflated past a chosen size
+// with an ignored field, the way a real Stripe object grows: more data, same
+// shape.
+func webEventBodyPadded(id, account, objectID string, atLeast int) []byte {
+	return []byte(fmt.Sprintf(
+		`{"id":%q,"object":"event","type":"checkout.session.completed","created":%d,`+
+			`"livemode":true,"context":%q,"api_version":%q,`+
+			`"data":{"object":{"id":%q,"object":"checkout.session","description":%q}}}`,
+		id, time.Now().Unix(), account, stripepay.ExpectedAPIVersion, objectID,
+		strings.Repeat("x", atLeast)))
+}
+
+// A genuine event larger than the browser form cap must still be stored. The
+// global 64 KiB cap used to apply to webhooks too, and nothing documents that
+// every subscribed Stripe event stays under it — so an oversized genuine event
+// failed the read, answered 500, was retried for three days, and was then lost
+// with only log lines, because nothing had ever been stored. This fails against
+// the pre-fix middleware chain.
+func TestStripeWebhookAcceptsAnEventLargerThanTheFormCap(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := eventID()
+	t.Cleanup(func() { deleteEvent(t, id) })
+
+	// Comfortably past 64 KiB, comfortably under the webhook cap.
+	body := webEventBodyPadded(id, testMembershipsAcct, "cs_test_web_big", 100<<10)
+	w := deliver(t, s, core.Memberships, testMembershipsSecret, body, time.Now())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d (%s), want 200: a genuine event bigger than a browser form was refused",
+			w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	if countEvents(t, id) != 1 {
+		t.Error("the oversized event was acknowledged but not stored")
+	}
+}
+
+// And the webhook cap is still a cap: a body past ITS bound is refused with a
+// retryable status and stores nothing. This is the boundary the cap exists at,
+// not an accident of the form limit.
+func TestStripeWebhookRefusesABodyPastItsOwnCap(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := eventID()
+	t.Cleanup(func() { deleteEvent(t, id) })
+
+	body := webEventBodyPadded(id, testMembershipsAcct, "cs_test_web_huge", maxWebhookBytes+1)
+	w := deliver(t, s, core.Memberships, testMembershipsSecret, body, time.Now())
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500: past the cap the handler must refuse retryably", w.Code)
+	}
+	if countEvents(t, id) != 0 {
+		t.Error("a body past the cap was stored anyway")
 	}
 }
