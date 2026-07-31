@@ -590,17 +590,43 @@ func (p *Projector) subscriptionIDFor(event inbox.Event) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Stripe renders the reference either as a bare id or, when expanded, as an
-	// object. Both spellings appear in the wild depending on API version and
-	// expansion, so read both rather than assuming.
-	switch ref := object["subscription"].(type) {
+	// An invoice's subscription lives under `parent`, not at the top level. On API
+	// version 2026-07-29.dahlia a real renewal looks like:
+	//
+	//	"parent": {
+	//	  "type": "subscription_details",
+	//	  "subscription_details": { "subscription": "sub_..." }
+	//	}
+	//
+	// This is not a detail I reasoned my way to. The first real Stripe delivery
+	// recorded "no subscription reference" and changed nothing, because this
+	// function only read object["subscription"] — where older API versions put it
+	// — and the test fake echoed that same assumption back, so every lifecycle
+	// test agreed with the bug. A renewal would have silently failed to advance
+	// any membership in production.
+	if parent, ok := object["parent"].(map[string]any); ok {
+		if details, ok := parent["subscription_details"].(map[string]any); ok {
+			if id := referenceID(details["subscription"]); id != "" {
+				return id, nil
+			}
+		}
+	}
+	// The legacy top-level spelling, kept because it costs one line and other
+	// objects and older versions still use it.
+	return referenceID(object["subscription"]), nil
+}
+
+// referenceID reads a Stripe reference that may be a bare id or, when expanded,
+// an object carrying one.
+func referenceID(value any) string {
+	switch ref := value.(type) {
 	case string:
-		return ref, nil
+		return ref
 	case map[string]any:
 		id, _ := ref["id"].(string)
-		return id, nil
+		return id
 	}
-	return "", nil
+	return ""
 }
 
 // sessionIDFor finds the Checkout Session an event concerns. Subscription and

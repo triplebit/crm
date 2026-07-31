@@ -467,10 +467,20 @@ func (f *settlementFixture) receiveInvoice(t *testing.T, eventType, invoiceID, s
 	t.Helper()
 	id := uuid.New()
 	stripeID := "evt_" + strings.ReplaceAll(id.String(), "-", "")
+	// The shape a REAL Stripe invoice has on API version 2026-07-29.dahlia:
+	// the subscription hangs off `parent`, not the top level. This fixture used
+	// to put it at object["subscription"] — my own assumption, which the code
+	// then read back, so every lifecycle test passed while a real renewal
+	// resolved to nothing. Copied from an actual delivered payload.
 	payload, _ := json.Marshal(map[string]any{
-		"id": stripeID, "type": eventType,
+		"id": stripeID, "type": eventType, "api_version": "2026-07-29.dahlia",
 		"data": map[string]any{"object": map[string]any{
-			"id": invoiceID, "object": "invoice", "subscription": subscriptionID,
+			"id": invoiceID, "object": "invoice",
+			"parent": map[string]any{
+				"type":                 "subscription_details",
+				"quote_details":        nil,
+				"subscription_details": map[string]any{"subscription": subscriptionID, "metadata": map[string]any{}},
+			},
 		}},
 	})
 	event := inbox.Event{
