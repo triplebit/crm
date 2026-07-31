@@ -7,6 +7,9 @@
 /.mcp.json
 /.claude/
 
+# Shared project instructions for coding and review agents.
+!/AGENTS.md
+
 # Secrets. Only .env.example is tracked.
 .env
 .env.*
