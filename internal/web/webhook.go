@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"triplebit.org/portal/internal/core"
 	"triplebit.org/portal/internal/repo/inbox"
 	"triplebit.org/portal/internal/stripepay"
@@ -71,6 +73,12 @@ func (s *Server) stripeWebhook(account core.AccountRef) handler {
 		}
 
 		stored, err := s.inbox.Receive(c.r.Context(), s.pool.Conn(), inbox.Event{
+			// The row's own identity. Omitting it sent the all-zeros UUID, which
+			// the first delivery claimed and every later distinct delivery then
+			// collided with on the primary key — a 500 that Stripe retried for
+			// three days before giving up. The portal could hold exactly one
+			// webhook event, ever, and nothing after it ever settled.
+			ID:          uuid.New(),
 			StripeID:    event.ID,
 			Type:        event.Type,
 			Environment: s.stripeEnv,

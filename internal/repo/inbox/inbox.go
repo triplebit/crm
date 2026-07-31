@@ -65,6 +65,20 @@ func (e Event) ObjectFromPayload() (map[string]any, error) {
 // rather than a second projection. The boolean says which happened, so the
 // handler can answer 200 either way while the log can tell them apart.
 func (r *Repo) Receive(ctx context.Context, q db.Conn, e Event, receivedAt time.Time, stripeCreatedAt time.Time) (stored bool, err error) {
+	// A caller that forgot the row id gets one rather than a corrupted inbox.
+	// The webhook handler omitted it, so every delivery carried the all-zeros
+	// UUID: the first event claimed it and every later DISTINCT event collided on
+	// the primary key, which ON CONFLICT (environment, account_ref,
+	// stripe_event_id) does not cover. The result was a 500 Stripe retried for
+	// three days, and an inbox that could hold exactly one event forever.
+	//
+	// Guarded here as well as fixed there, because this is the only place that
+	// knows the row is being created and the cost of being wrong is every
+	// settlement after the first.
+	if e.ID == uuid.Nil {
+		e.ID = uuid.New()
+	}
+
 	// next_attempt_at is set to receivedAt rather than left to the column's
 	// DEFAULT now(). The default is the DATABASE's clock while Claim compares
 	// against the caller's, and a due-time comparison across two clocks is a

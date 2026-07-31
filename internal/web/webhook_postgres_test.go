@@ -200,3 +200,52 @@ func deleteEvent(t *testing.T, stripeID string) {
 	_, _ = testdb.Pool(t).Conn().Exec(context.Background(),
 		`DELETE FROM webhook_events WHERE stripe_event_id = $1`, stripeID)
 }
+
+// Two DIFFERENT events must both be stored.
+//
+// This is the regression test for the worst defect in the milestone. The handler
+// omitted the row's own id, so every delivery inserted the all-zeros UUID: the
+// first event claimed it and every later distinct event collided on the primary
+// key — which ON CONFLICT (environment, account_ref, stripe_event_id) does not
+// cover — producing a 500 that Stripe retried for three days before giving up.
+// The portal could hold exactly one webhook event for its entire life, and
+// nothing after the first ever settled.
+//
+// Every existing test missed it, and the shape of the gap is the lesson: one
+// test stored a single event, one stored the SAME event three times (which is the
+// intended ON CONFLICT path, and passes), and the projector tests build
+// inbox.Event values themselves so they never exercise what the handler fills in.
+// Nothing stored two distinct events through the HTTP boundary.
+func TestTwoDifferentEventsAreBothStored(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	first, second := eventID(), eventID()
+	t.Cleanup(func() { deleteEvent(t, first); deleteEvent(t, second) })
+
+	for _, id := range []string{first, second} {
+		w := deliver(t, s, core.Memberships, testMembershipsSecret,
+			webEventBody(id, testMembershipsAcct, "cs_"+id), time.Now())
+		if w.Code != http.StatusOK {
+			t.Fatalf("event %s: status %d (%s), want 200", id, w.Code,
+				strings.TrimSpace(w.Body.String()))
+		}
+	}
+
+	for _, id := range []string{first, second} {
+		if n := countEvents(t, id); n != 1 {
+			t.Errorf("event %s stored %d times, want 1", id, n)
+		}
+	}
+
+	// And their row ids must differ, which is the actual invariant: two events
+	// sharing one primary key is what broke.
+	var distinctRowIDs int
+	if err := testdb.Pool(t).Conn().QueryRow(context.Background(), `
+		SELECT count(DISTINCT id) FROM webhook_events WHERE stripe_event_id = ANY($1)
+	`, []string{first, second}).Scan(&distinctRowIDs); err != nil {
+		t.Fatalf("count row ids: %v", err)
+	}
+	if distinctRowIDs != 2 {
+		t.Errorf("%d distinct row ids for 2 events; the handler is reusing one", distinctRowIDs)
+	}
+}
