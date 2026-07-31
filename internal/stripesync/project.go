@@ -179,40 +179,10 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 		return err
 	}
 
-	newer, err := p.billing.HasNewerObservation(ctx, p.pool.Conn(), p.env, event.Account,
-		session.ID, session.RetrievedAt)
-	if err != nil {
-		return err
-	}
-	if newer {
-		// A fresher observation of this object is already written. Applying
-		// this one would move settled state backwards.
-		_, err := p.billing.RecordApplication(ctx, p.pool.Conn(), billing.Application{
-			Environment: p.env, Account: event.Account,
-			StripeEvent: event.StripeID, EventType: event.Type,
-			Signal: "superseded by a newer observation", ObjectID: session.ID,
-			ObservedAt: session.RetrievedAt, Canonical: []byte("{}"),
-		})
-		return err
-	}
-
 	orderID, err := uuid.Parse(session.OrderReference)
 	if err != nil {
 		return fmt.Errorf("stripesync: session %s carries no usable order reference %q",
 			session.ID, session.OrderReference)
-	}
-	order, err := p.orders.ByCheckoutSession(ctx, p.pool.Conn(), p.env, event.Account, session.ID)
-	if err != nil {
-		return err
-	}
-	if order.ID != orderID {
-		return fmt.Errorf("stripesync: session %s references order %s but is attached to %s",
-			session.ID, orderID, order.ID)
-	}
-
-	lines, err := p.orders.Lines(ctx, p.pool.Conn(), order.ID)
-	if err != nil {
-		return err
 	}
 
 	// Every remote read happens HERE, before the transaction opens. WithTx's
@@ -220,6 +190,10 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 	// both bite: the callback can be invoked more than once under retry, and a
 	// transaction held open across network latency holds locks for as long as
 	// Stripe takes to answer.
+	//
+	// The subscription is fetched on the payload's word that this session is
+	// paid. The transaction re-decides from canonical state, so a wasted fetch
+	// is the only cost of being wrong here.
 	var subscription *stripepay.CanonicalSubscription
 	if session.PaymentStatus == "paid" && session.SubscriptionID != "" {
 		got, err := p.pay.GetCanonicalSubscription(ctx, event.Account, session.SubscriptionID)
@@ -232,10 +206,61 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 	canonical, _ := json.Marshal(session)
 	signal := "no change"
 
-	// One transaction, database writes only: the settlement and the record
-	// that it happened commit together, so a crash cannot leave state changed
-	// with no trace of why.
-	err = p.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
+	// One transaction for every read AND every write that decides anything.
+	//
+	// The freshness check and the order read used to run on the pool, before
+	// this opened, and the transaction then acted on those stale values. Two
+	// consequences, both real: concurrent deliveries could each pass the same
+	// freshness check because neither had recorded its application yet; and if
+	// another worker settled the order in between, Settle returned false while
+	// the stale copy still said checkout_pending — so an ordinary duplicate
+	// delivery fell into the "paid while not payable" branch and paged a human.
+	//
+	// The advisory lock is what makes the guard a guard. It serializes every
+	// transaction projecting THIS Stripe object, so the freshness check cannot be
+	// overtaken between reading and writing. It is keyed on the object rather
+	// than the order because the same mechanism has to serve subscription events,
+	// which may have no local row to lock at all.
+	// The error is a NAMED return because the deferred application record below
+	// must be able to surface its own failure. With an unnamed return the defer
+	// would assign to a local and the transaction would commit reporting success.
+	err = p.pool.WithTx(ctx, db.TxOptions{Lock: objectLock(p.env, event.Account, session.ID)}, func(c db.Conn) (err error) {
+		newer, err := p.billing.HasNewerObservation(ctx, c, p.env, event.Account,
+			session.ID, session.RetrievedAt)
+		if err != nil {
+			return err
+		}
+		if newer {
+			// A fresher observation of this object is already written. Applying
+			// this one would move settled state backwards.
+			signal = "superseded by a newer observation"
+			return p.record(ctx, c, event, signal, session.ID, nil, session.RetrievedAt, nil)
+		}
+
+		order, err := p.orders.ByCheckoutSession(ctx, c, p.env, event.Account, session.ID)
+		if err != nil {
+			return err
+		}
+		if order.ID != orderID {
+			return fmt.Errorf("stripesync: session %s references order %s but is attached to %s",
+				session.ID, orderID, order.ID)
+		}
+		lines, err := p.orders.Lines(ctx, c, order.ID)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			// Recorded on every path, including the escalations. A branch that
+			// returned before this left the event with no application row, so the
+			// ordering guard had no trace of it and a later delivery could reach
+			// the same conclusion again.
+			if recErr := p.record(ctx, c, event, signal, session.ID, &order.ID,
+				session.RetrievedAt, canonical); recErr != nil && err == nil {
+				err = recErr
+			}
+		}()
+
 		switch {
 		case session.Status == "expired":
 			abandoned, err := p.orders.Abandon(ctx, c, order.ID, p.now().UTC(),
@@ -299,14 +324,38 @@ func (p *Projector) project(ctx context.Context, event inbox.Event, via route) e
 				return err
 			}
 		}
+		return nil // The deferred record above writes the application row.
+	})
+	return err
+}
 
-		_, err := p.billing.RecordApplication(ctx, c, billing.Application{
-			Environment: p.env, Account: event.Account,
-			StripeEvent: event.StripeID, EventType: event.Type,
-			Signal: signal, ObjectID: session.ID, OrderID: &order.ID,
-			ObservedAt: session.RetrievedAt, Canonical: canonical,
-		})
-		return err
+// objectLock names the advisory lock that serializes every projection of one
+// Stripe object.
+//
+// Scoped by environment and account as well as id, because a sandbox worker and
+// a live worker sharing a database must not block each other, and the same
+// identifier in two accounts is two different objects.
+func objectLock(env core.StripeEnvironment, account core.AccountRef, objectID string) string {
+	return "stripe-projection:" + env.String() + ":" + account.String() + ":" + objectID
+}
+
+// record writes the application row that says what this event decided.
+//
+// Every path through a projection ends here, including the ones that refuse to
+// act. An event with no application row is invisible to the ordering guard, so a
+// later delivery can reach the same conclusion and raise the same alarm again —
+// which is what happened when the escalation branches returned early.
+func (p *Projector) record(ctx context.Context, c db.Conn, event inbox.Event,
+	signal, objectID string, orderID *uuid.UUID, observedAt time.Time, canonical []byte,
+) error {
+	if len(canonical) == 0 {
+		canonical = []byte("{}")
+	}
+	_, err := p.billing.RecordApplication(ctx, c, billing.Application{
+		Environment: p.env, Account: event.Account,
+		StripeEvent: event.StripeID, EventType: event.Type,
+		Signal: signal, ObjectID: objectID, OrderID: orderID,
+		ObservedAt: observedAt, Canonical: canonical,
 	})
 	return err
 }
@@ -463,21 +512,6 @@ func (p *Projector) projectSubscription(ctx context.Context, event inbox.Event) 
 		return err
 	}
 
-	newer, err := p.billing.HasNewerObservation(ctx, p.pool.Conn(), p.env, event.Account,
-		subscription.ID, subscription.RetrievedAt)
-	if err != nil {
-		return err
-	}
-	if newer {
-		_, err := p.billing.RecordApplication(ctx, p.pool.Conn(), billing.Application{
-			Environment: p.env, Account: event.Account,
-			StripeEvent: event.StripeID, EventType: event.Type,
-			Signal: "superseded by a newer observation", ObjectID: subscription.ID,
-			ObservedAt: subscription.RetrievedAt, Canonical: []byte("{}"),
-		})
-		return err
-	}
-
 	canonical, _ := json.Marshal(subscription)
 	var periodEnd *time.Time
 	if !subscription.CurrentPeriodEnd.IsZero() {
@@ -485,7 +519,22 @@ func (p *Projector) projectSubscription(ctx context.Context, event inbox.Event) 
 		periodEnd = &end
 	}
 
-	return p.pool.WithTx(ctx, db.TxOptions{}, func(c db.Conn) error {
+	// Same shape as the session path, for the same reason: the freshness check
+	// belongs inside the transaction that acts on it, serialized on the object.
+	// Without the lock two workers could each find no newer observation and then
+	// apply in either order, so an older canonical status could overwrite a newer
+	// one — a cancelled membership coming back to life.
+	return p.pool.WithTx(ctx, db.TxOptions{Lock: objectLock(p.env, event.Account, subscription.ID)}, func(c db.Conn) error {
+		newer, err := p.billing.HasNewerObservation(ctx, c, p.env, event.Account,
+			subscription.ID, subscription.RetrievedAt)
+		if err != nil {
+			return err
+		}
+		if newer {
+			return p.record(ctx, c, event, "superseded by a newer observation",
+				subscription.ID, nil, subscription.RetrievedAt, nil)
+		}
+
 		applied, err := p.billing.UpdateMembershipLifecycle(ctx, c, p.env, event.Account,
 			subscription.ID, subscription.Status, periodEnd, subscription.CancelAtPeriodEnd)
 		if err != nil {
@@ -526,13 +575,8 @@ func (p *Projector) projectSubscription(ctx context.Context, event inbox.Event) 
 			}
 		}
 
-		_, err = p.billing.RecordApplication(ctx, c, billing.Application{
-			Environment: p.env, Account: event.Account,
-			StripeEvent: event.StripeID, EventType: event.Type,
-			Signal: signal, ObjectID: subscription.ID,
-			ObservedAt: subscription.RetrievedAt, Canonical: canonical,
-		})
-		return err
+		return p.record(ctx, c, event, signal, subscription.ID, nil,
+			subscription.RetrievedAt, canonical)
 	})
 }
 
