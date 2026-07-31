@@ -18,11 +18,18 @@ import (
 	"triplebit.org/portal/internal/tokens"
 )
 
-// ErrLoginFailed means an OIDC callback could not be completed. Like
-// ErrNoSession it is deliberately one error for every cause — unknown or
-// expired transaction, state mismatch, failed exchange, bad token, unverified
-// email — because the caller's remedy is always the same (start over), and
-// distinguishing causes for the caller distinguishes them for an attacker.
+// ErrLoginFailed means an OIDC callback could not be completed. Every cause
+// matches it — unknown or expired transaction, state mismatch, failed exchange,
+// bad token, unverified email — because the MEMBER's remedy is always the same
+// (start over), and distinguishing causes for the member distinguishes them for
+// an attacker.
+//
+// Each return site wraps it with a cause for the operator. That distinction is
+// the whole point: the member sees one vague sentence, the log names the reason.
+// Before this, nine refusals returned the bare error and the handler logged
+// nothing, so a misconfigured identity provider presented as an unexplained
+// "Sign-in could not be completed" and had to be diagnosed by reading Pocket
+// ID's own database. Use errors.Is, never equality, to test for it.
 var ErrLoginFailed = errors.New("auth: sign-in could not be completed")
 
 // Identity is what a completed Pocket ID sign-in asserts about a person.
@@ -171,35 +178,41 @@ func (o *OIDC) Begin(ctx context.Context) (authURL string, loginToken tokens.Tok
 func (o *OIDC) Complete(ctx context.Context, rawLoginToken, state, code string) (Identity, error) {
 	loginToken, err := tokens.Parse(rawLoginToken)
 	if err != nil {
-		return Identity{}, ErrLoginFailed
+		return Identity{}, fmt.Errorf("%w: the login cookie is not a valid token", ErrLoginFailed)
 	}
 	tx, err := o.repo.ConsumeLoginTransaction(ctx, o.pool.Conn(), loginToken.Digest(), o.now().UTC())
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
-			return Identity{}, ErrLoginFailed
+			return Identity{}, fmt.Errorf(
+				"%w: no unconsumed login transaction matches this cookie (expired, "+
+					"already used, or a replayed callback)", ErrLoginFailed)
 		}
 		// A database failure is an outage, not a bad login; the caller must not
 		// present it as "try signing in again".
 		return Identity{}, err
 	}
 	if subtle.ConstantTimeCompare([]byte(tx.State), []byte(state)) != 1 {
-		return Identity{}, ErrLoginFailed
+		return Identity{}, fmt.Errorf("%w: the state parameter does not match the login transaction", ErrLoginFailed)
 	}
 
 	oauthToken, err := o.oauth.Exchange(ctx, code, oauth2.VerifierOption(tx.PKCEVerifier))
 	if err != nil {
-		return Identity{}, ErrLoginFailed
+		// Includes a client-secret mismatch and a PKCE rejection, which look
+		// identical to a member and very different to an operator.
+		return Identity{}, fmt.Errorf("%w: the token exchange failed: %v", ErrLoginFailed, err)
 	}
 	rawIDToken, ok := oauthToken.Extra("id_token").(string)
 	if !ok || rawIDToken == "" {
-		return Identity{}, ErrLoginFailed
+		return Identity{}, fmt.Errorf("%w: the token response carried no id_token", ErrLoginFailed)
 	}
 	idToken, err := o.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return Identity{}, ErrLoginFailed
+		// Issuer, audience, signature or expiry. An issuer mismatch here is the
+		// classic "PORTAL_OIDC_ISSUER does not equal Pocket ID's APP_URL".
+		return Identity{}, fmt.Errorf("%w: the ID token did not verify: %v", ErrLoginFailed, err)
 	}
 	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(tx.Nonce)) != 1 {
-		return Identity{}, ErrLoginFailed
+		return Identity{}, fmt.Errorf("%w: the ID token nonce does not match the login transaction", ErrLoginFailed)
 	}
 
 	var claims struct {
@@ -210,13 +223,29 @@ func (o *OIDC) Complete(ctx context.Context, rawLoginToken, state, code string) 
 		AMR               []string `json:"amr"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
-		return Identity{}, ErrLoginFailed
+		return Identity{}, fmt.Errorf("%w: the ID token claims could not be decoded: %v", ErrLoginFailed, err)
 	}
 	// An unverified address must never enter the users table: email is how
 	// staff reach a member, and accepting an unverified one would let anyone
 	// register an account that appears to belong to someone else.
-	if idToken.Subject == "" || claims.Email == "" || !claims.EmailVerified {
-		return Identity{}, ErrLoginFailed
+	//
+	// The reasons are named because they are not interchangeable. Every refusal
+	// in this function used to return a bare ErrLoginFailed, so nine distinct
+	// causes produced one indistinguishable outcome, the handler logged nothing,
+	// and diagnosing a real failure meant reading the identity provider's
+	// database. The member still sees one deliberately vague sentence; the
+	// operator now gets the cause.
+	switch {
+	case idToken.Subject == "":
+		return Identity{}, fmt.Errorf("%w: the ID token carries no subject", ErrLoginFailed)
+	case claims.Email == "":
+		return Identity{}, fmt.Errorf("%w: the ID token carries no email address", ErrLoginFailed)
+	case !claims.EmailVerified:
+		return Identity{}, fmt.Errorf(
+			"%w: Pocket ID reports this email as unverified, and an unverified "+
+				"address must never enter the users table. Verify it in Pocket ID, "+
+				"or set EMAILS_VERIFIED=true there for a development instance",
+			ErrLoginFailed)
 	}
 
 	displayName := claims.Name

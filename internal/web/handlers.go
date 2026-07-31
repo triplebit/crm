@@ -4,12 +4,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"triplebit.org/portal/internal/auth"
 	"triplebit.org/portal/internal/checkout"
 	"triplebit.org/portal/internal/core"
+	"triplebit.org/portal/internal/httpx"
 	"triplebit.org/portal/internal/money"
 	"triplebit.org/portal/internal/safeerr"
 	"triplebit.org/portal/internal/web/viewdata"
@@ -113,6 +115,15 @@ func (s *Server) callback(c *reqctx) error {
 	identity, err := s.oidc.Complete(c.r.Context(), rawLogin, query.Get("state"), query.Get("code"))
 	if err != nil {
 		if errors.Is(err, auth.ErrLoginFailed) {
+			// WARN, not ERROR: a refused sign-in is usually someone's expired tab,
+			// not an outage, so it must not page anyone. But it MUST be logged —
+			// this branch used to redirect silently, which meant a
+			// misconfigured identity provider produced a member-visible failure
+			// with no operator signal anywhere.
+			s.logger.WarnContext(c.r.Context(), "sign-in refused",
+				slog.String("request_id", httpx.RequestID(c.r.Context())),
+				slog.String("error", err.Error()),
+			)
 			return c.redirectWithNotice("login-failed")
 		}
 		return err

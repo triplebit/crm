@@ -54,6 +54,23 @@ services:
       # Mandatory from Pocket ID v2: it encrypts its own secrets at rest, and
       # refuses to start without a key of at least 16 characters.
       ENCRYPTION_KEY: ${POCKET_ID_ENCRYPTION_KEY:?set in .env — see .env.example}
+      # Pocket ID defaults EMAILS_VERIFIED to false, so an account created by the
+      # first-run setup carries email_verified=false in its ID token — and the
+      # portal refuses an unverified address outright, because email is how staff
+      # reach a member. The symptom is a sign-in that returns to the portal saying
+      # "Sign-in could not be completed", with the token exchange succeeding.
+      #
+      # This is the third breaking change the v1→v2 upgrade produced that only a
+      # real sign-in reveals, after the mandatory ENCRYPTION_KEY and the
+      # PostgreSQL 18 data directory.
+      #
+      # DEVELOPMENT ONLY, and it makes the portal's check vacuous: it asserts
+      # every address is verified without anyone verifying one. Production must
+      # NOT copy this. Instead set EMAIL_VERIFICATION_ENABLED=true with real SMTP
+      # so the claim means something, or decide explicitly that an
+      # admin-provisioned account counts as verified and record that decision —
+      # M8 owns it.
+      EMAILS_VERIFIED: "true"
     ports:
       - "1411:1411"
     volumes:
@@ -140,6 +157,17 @@ services:
       PORTAL_STRIPE_SECRET_KEY: ${PORTAL_STRIPE_SECRET_KEY:?set in .env — see .env.example}
       PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT: ${PORTAL_STRIPE_MEMBERSHIPS_ACCOUNT:?set in .env}
       PORTAL_STRIPE_DONATIONS_ACCOUNT: ${PORTAL_STRIPE_DONATIONS_ACCOUNT:?set in .env}
+    # The image's HEALTHCHECK probes http://127.0.0.1:8080/healthz, which only the
+    # serve command answers. Inheriting it marked a perfectly healthy worker
+    # unhealthy on every interval — and in production that is an orchestrator
+    # restarting the settlement processor forever, on a signal that means nothing.
+    #
+    # Disabled rather than replaced: liveness for this process is "it is claiming
+    # events", which the loop's own logging and the dead-letter alerts already
+    # report, and a probe that merely proves the process is running would be
+    # decoration. Give it a real check when there is a real question to ask.
+    healthcheck:
+      disable: true
     depends_on:
       migrate:
         condition: service_completed_successfully
